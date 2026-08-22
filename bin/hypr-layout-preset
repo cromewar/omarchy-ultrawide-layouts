@@ -1,0 +1,320 @@
+#!/bin/bash
+# hypr-layout-preset — switch the focused Hyprland workspace between layout
+# presets chosen for a super-ultrawide panel.
+#
+# Hyprland keeps three separate knobs for this:
+#   * the workspace's layout        (dwindle | master | scrolling)
+#   * the master layout orientation (left | right | center | ...)
+#   * mfact, the master's share of the width
+# A "preset" is one fixed combination of the three. Layout and orientation are
+# workspace rules, so they persist across `hyprctl reload` once written to
+# Omarchy's workspace-layouts state dir. mfact is not expressible as a rule and
+# has to go through the layoutmsg dispatcher, which acts on the focused
+# workspace — which is why every command here operates on the focused workspace.
+set -uo pipefail
+
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+PRESET_DIR="$STATE_HOME/omarchy/layout-presets"
+# Shared with omarchy-hyprland-workspace-layout-toggle (SUPER + L) on purpose,
+# so both write the same file and neither silently loses to the other.
+RULE_DIR="$STATE_HOME/omarchy/workspace-layouts"
+
+# key|label|icon|layout|orientation|mfact   (cycle order)
+PRESETS=(
+  "center|Center master||master|center|0.5"
+  "thirds|Even thirds||master|center|0.3334"
+  "left|Master left||master|left|0.5"
+  "right|Master right||master|right|0.5"
+  "dwindle|Dwindle|󰕰|dwindle||"
+  "scrolling|Scrolling|󰓡|scrolling||"
+)
+
+MFACT_MIN=0.15
+MFACT_MAX=0.85
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+command -v hyprctl >/dev/null || die "hyprctl not found"
+command -v jq >/dev/null || die "jq not found"
+
+# Off by default: the bar widget shows the change itself, so a toast on every
+# click would be noise. The keybinding passes --notify, where there is nothing
+# else to confirm the press.
+NOTIFY=0
+
+notify_current() {
+  [[ "$NOTIFY" == "1" ]] || return 0
+  command -v omarchy-notification-send >/dev/null || return 0
+  local ws mon key row geom
+  ws=$(ws_id); mon=$(ws_monitor)
+  key=$(current_key "$ws" "$mon")
+  row=$(row_for "$key") || return 0
+  geom=$(geometry_for "$key" "$(monitor_width "$mon")" "$(field "$row" 6)")
+  omarchy-notification-send -g "$(field "$row" 3)" "$(field "$row" 2)" "$geom"
+}
+
+row_for() {
+  local key="$1" row
+  for row in "${PRESETS[@]}"; do
+    [[ "${row%%|*}" == "$key" ]] && { printf '%s\n' "$row"; return 0; }
+  done
+  return 1
+}
+
+field() { cut -d'|' -f"$2" <<<"$1"; }
+
+keys() { local row; for row in "${PRESETS[@]}"; do printf '%s\n' "${row%%|*}"; done; }
+
+ws_id()      { hyprctl activeworkspace -j | jq -r '.id'; }
+ws_monitor() { hyprctl activeworkspace -j | jq -r '.monitor'; }
+ws_layout()  { hyprctl activeworkspace -j | jq -r '.tiledLayout // ""'; }
+
+monitor_width() {
+  hyprctl monitors -j | jq -r --arg m "$1" '
+    .[] | select(.name == $m)
+    | (if (.transform % 2) == 1 then .height else .width end) / .scale
+    | round'
+}
+
+# The live master share, measured rather than remembered: the widest tiled
+# window on the workspace is the master, so its width over the monitor width is
+# mfact. Self-corrects after a manual resize, a fresh session, or a SUPER + L
+# toggle, none of which tell us anything. Falls back to the stored value on an
+# empty workspace, where there is nothing to measure.
+live_mfact() {
+  local ws="$1" mon="$2" width measured
+  width=$(monitor_width "$mon")
+  [[ -z "$width" || "$width" -le 0 ]] && { stored_mfact "$ws"; return; }
+  measured=$(hyprctl clients -j | jq -r --argjson ws "$ws" --argjson w "$width" '
+    [ .[] | select(.workspace.id == $ws and .floating == false and .mapped == true) | .size[0] ]
+    | if length == 0 then empty else (max / $w * 1000 | round / 1000) end')
+  [[ -z "$measured" ]] && { stored_mfact "$ws"; return; }
+  printf '%s\n' "$measured"
+}
+
+stored_mfact() {
+  local f="$PRESET_DIR/$1.mfact"
+  [[ -r "$f" ]] && cat "$f" || echo "0.5"
+}
+
+stored_key() {
+  local f="$PRESET_DIR/$1.key"
+  [[ -r "$f" ]] && cat "$f" || echo ""
+}
+
+# What the workspace is actually doing wins over what we last wrote, so a
+# SUPER + L toggle or a hand-edited config is reported honestly. The stored key
+# only breaks ties between presets that share a layout (centre vs thirds).
+current_key() {
+  local ws="$1" mon="$2" layout stored row mfact best bestdist dist
+  layout=$(ws_layout)
+  stored=$(stored_key "$ws")
+
+  [[ "$layout" != "master" ]] && { printf '%s\n' "$layout"; return; }
+
+  # Among the master presets, pick the one whose mfact is closest to live.
+  mfact=$(live_mfact "$ws" "$mon")
+  if [[ -n "$stored" ]] && row=$(row_for "$stored") && [[ "$(field "$row" 4)" == "master" ]]; then
+    dist=$(awk -v a="$mfact" -v b="$(field "$row" 6)" 'BEGIN{d=a-b; print (d<0?-d:d)}')
+    awk -v d="$dist" 'BEGIN{exit !(d < 0.04)}' && { printf '%s\n' "$stored"; return; }
+  fi
+
+  best=""; bestdist=99
+  for row in "${PRESETS[@]}"; do
+    [[ "$(field "$row" 4)" == "master" ]] || continue
+    dist=$(awk -v a="$mfact" -v b="$(field "$row" 6)" 'BEGIN{d=a-b; print (d<0?-d:d)}')
+    awk -v d="$dist" -v bd="$bestdist" 'BEGIN{exit !(d < bd)}' && { best="${row%%|*}"; bestdist="$dist"; }
+  done
+  printf '%s\n' "${best:-center}"
+}
+
+# Column widths a preset produces on a monitor this wide, gaps excluded.
+geometry_for() {
+  local key="$1" width="$2" mfact="$3" row layout orientation master side
+  row=$(row_for "$key") || { printf '\n'; return; }
+  layout=$(field "$row" 4)
+  orientation=$(field "$row" 5)
+  [[ -z "$width" || "$width" -le 0 ]] && { printf '\n'; return; }
+
+  case "$layout" in
+    master)
+      master=$(awk -v w="$width" -v m="$mfact" 'BEGIN{printf "%d", w*m}')
+      if [[ "$orientation" == "center" ]]; then
+        side=$(awk -v w="$width" -v m="$master" 'BEGIN{printf "%d", (w-m)/2}')
+        printf '%s · %s · %s\n' "$side" "$master" "$side"
+      else
+        side=$((width - master))
+        [[ "$orientation" == "right" ]] && printf '%s · %s\n' "$side" "$master" \
+                                        || printf '%s · %s\n' "$master" "$side"
+      fi
+      ;;
+    dwindle)   printf 'binary split\n' ;;
+    scrolling) printf 'scrolling columns\n' ;;
+  esac
+}
+
+# Live + persisted in one go. The eval applies it now; the state file is what
+# survives `hyprctl reload`, and Omarchy loads that dir after ~/.config/hypr,
+# so it wins over the m[DP-3] rule in looknfeel.lua.
+apply_rule() {
+  local ws="$1" layout="$2" orientation="$3" lua
+  if [[ -n "$orientation" ]]; then
+    lua=$(printf 'hl.workspace_rule({ workspace = "%s", layout = "%s", layout_opts = { orientation = "%s" } })' \
+          "$ws" "$layout" "$orientation")
+  else
+    lua=$(printf 'hl.workspace_rule({ workspace = "%s", layout = "%s" })' "$ws" "$layout")
+  fi
+  mkdir -p "$RULE_DIR"
+  printf '%s\n' "$lua" > "$RULE_DIR/$ws.lua"
+  hyprctl eval "$lua" >/dev/null 2>&1 \
+    || hyprctl keyword workspace "$ws, layout:$layout" >/dev/null 2>&1
+}
+
+apply_mfact() {
+  hyprctl eval "hl.dispatch(hl.dsp.layout(\"mfact exact $1\"))" >/dev/null 2>&1
+}
+
+clamp_mfact() {
+  awk -v v="$1" -v lo="$MFACT_MIN" -v hi="$MFACT_MAX" \
+    'BEGIN{ if (v<lo) v=lo; if (v>hi) v=hi; printf "%.4f", v }'
+}
+
+set_preset() {
+  local key="$1" row ws mon layout orientation mfact
+  row=$(row_for "$key") || die "unknown preset: $key (try: $(keys | paste -sd' '))"
+  ws=$(ws_id); mon=$(ws_monitor)
+  [[ "$ws" =~ ^-?[0-9]+$ ]] || die "no focused workspace"
+
+  layout=$(field "$row" 4)
+  orientation=$(field "$row" 5)
+  mfact=$(field "$row" 6)
+
+  apply_rule "$ws" "$layout" "$orientation"
+  mkdir -p "$PRESET_DIR"
+  printf '%s\n' "$key" > "$PRESET_DIR/$ws.key"
+  if [[ -n "$mfact" ]]; then
+    apply_mfact "$mfact"
+    printf '%s\n' "$mfact" > "$PRESET_DIR/$ws.mfact"
+  fi
+}
+
+nudge_mfact() {
+  local delta="$1" ws mon layout current next
+  ws=$(ws_id); mon=$(ws_monitor)
+  layout=$(ws_layout)
+  [[ "$layout" == "master" ]] || return 1
+  current=$(live_mfact "$ws" "$mon")
+  next=$(clamp_mfact "$(awk -v a="$current" -v d="$delta" 'BEGIN{print a+d}')")
+  apply_mfact "$next"
+  mkdir -p "$PRESET_DIR"
+  printf '%s\n' "$next" > "$PRESET_DIR/$ws.mfact"
+  printf '%s\n' "$next"
+}
+
+step_preset() {
+  local dir="$1" ws mon current all n i idx
+  ws=$(ws_id); mon=$(ws_monitor)
+  current=$(current_key "$ws" "$mon")
+  mapfile -t all < <(keys)
+  n=${#all[@]}
+  idx=0
+  for i in "${!all[@]}"; do [[ "${all[$i]}" == "$current" ]] && idx=$i; done
+  idx=$(( (idx + dir + n) % n ))
+  set_preset "${all[$idx]}"
+  printf '%s\n' "${all[$idx]}"
+}
+
+cmd_status() {
+  local ws mon width key row mfact nominal snapped
+  ws=$(ws_id); mon=$(ws_monitor)
+  if [[ ! "$ws" =~ ^-?[0-9]+$ ]]; then echo '{}'; return; fi
+  width=$(monitor_width "$mon")
+  key=$(current_key "$ws" "$mon")
+  row=$(row_for "$key") || row="$key|$key||$key||"
+  mfact=$(live_mfact "$ws" "$mon")
+
+  # The measured share always reads a little under the nominal one, because the
+  # gaps come out of the master's width. Report the preset's own numbers while
+  # the two agree, and only fall back to the measured ones once a manual resize
+  # has actually pulled the master somewhere else.
+  nominal=$(field "$row" 6)
+  snapped=false
+  if [[ -n "$nominal" ]] && awk -v a="$mfact" -v b="$nominal" 'BEGIN{d=a-b; if(d<0)d=-d; exit !(d < 0.015)}'; then
+    mfact="$nominal"
+    snapped=true
+  fi
+
+  jq -nc \
+    --argjson snapped "$snapped" \
+    --arg key "$key" \
+    --arg label "$(field "$row" 2)" \
+    --arg icon "$(field "$row" 3)" \
+    --arg layout "$(field "$row" 4)" \
+    --arg monitor "$mon" \
+    --arg geometry "$(geometry_for "$key" "$width" "$mfact")" \
+    --argjson ws "$ws" \
+    --argjson width "${width:-0}" \
+    --argjson mfact "$mfact" \
+    '{workspace:$ws, monitor:$monitor, width:$width, key:$key, label:$label,
+      icon:$icon, layout:$layout, mfact:$mfact, geometry:$geometry, snapped:$snapped}'
+}
+
+# Every preset with the geometry it would produce on the focused monitor, so a
+# menu can show real numbers rather than the ratios they came from.
+cmd_list() {
+  local ws mon width row key
+  ws=$(ws_id); mon=$(ws_monitor)
+  width=$(monitor_width "$mon")
+  for row in "${PRESETS[@]}"; do
+    key="${row%%|*}"
+    jq -nc \
+      --arg key "$key" \
+      --arg label "$(field "$row" 2)" \
+      --arg icon "$(field "$row" 3)" \
+      --arg layout "$(field "$row" 4)" \
+      --arg geometry "$(geometry_for "$key" "$width" "$(field "$row" 6)")" \
+      '{key:$key, label:$label, icon:$icon, layout:$layout, geometry:$geometry}'
+  done | jq -sc .
+}
+
+usage() {
+  cat <<USAGE
+hypr-layout-preset — ultrawide layout presets for the focused workspace
+
+  list            every preset as JSON, with the widths it gives on this monitor
+  status          the focused workspace's current preset as JSON
+  get             the current preset key
+  set <key>       apply a preset
+  next | prev     step through the presets in order
+  snap            re-apply the current preset (undo a manual resize)
+  wider [step]    grow the master   (default step 0.025)
+  narrower [step] shrink the master
+
+Presets: $(keys | paste -sd' ')
+
+Pass --notify before the subcommand to raise a desktop notification
+naming the preset it landed on. Used by the SUPER + L keybinding.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --notify) NOTIFY=1; shift ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+case "${1:-status}" in
+  list)     cmd_list ;;
+  status)   cmd_status ;;
+  get)      current_key "$(ws_id)" "$(ws_monitor)" ;;
+  set)      [[ $# -ge 2 ]] || die "set needs a preset key"; set_preset "$2"; notify_current ;;
+  next)     step_preset 1; notify_current ;;
+  prev)     step_preset -1; notify_current ;;
+  snap)     set_preset "$(current_key "$(ws_id)" "$(ws_monitor)")"; notify_current ;;
+  wider)    nudge_mfact "${2:-0.025}" ;;
+  narrower) nudge_mfact "-${2:-0.025}" ;;
+  -h|--help|help) usage ;;
+  *)        usage; exit 1 ;;
+esac

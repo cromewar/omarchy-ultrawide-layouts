@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "cromewar.ultrawide-layouts",
+  "name": "Ultrawide layouts",
+  "version": "1.0.0",
+  "author": "Vasiliy Kirochka",
+  "license": "MIT",
+  "homepage": "https://github.com/cromewar/omarchy-ultrawide-layouts",
+  "description": "Switch the focused workspace between Hyprland layout presets built for ultrawide panels, and resize the master column, from the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Ultrawide layouts",
+    "description": "One bar icon showing the focused workspace's layout preset. Left = pick a preset, right = next, middle = snap back, scroll = resize the master column.",
+    "category": "Compositor",
+    "aliases": ["layout", "ultrawide", "master", "presets"],
+    "allowMultiple": false,
+    "defaultSection": "left",
+    "defaults": {
+      "showLabel": false,
+      "mfactStep": 0.025
+    },
+    "schema": [
+      {
+        "key": "showLabel",
+        "type": "boolean",
+        "label": "Show the preset name next to the icon",
+        "defaultValue": false
+      },
+      {
+        "key": "mfactStep",
+        "type": "number",
+        "label": "Scroll step for the master column",
+        "min": 0.005,
+        "max": 0.1,
+        "step": 0.005,
+        "defaultValue": 0.025,
+        "description": "How much one scroll notch grows or shrinks the master window, as a fraction of the screen width."
+      }
+    ]
+  }
+}
