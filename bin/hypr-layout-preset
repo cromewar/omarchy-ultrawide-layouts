@@ -29,10 +29,10 @@ RULE_DIR="$STATE_HOME/omarchy/workspace-layouts"
 
 # key|label|icon|layout|orientation|mfact   (cycle order)
 PRESETS=(
-  "center|Center master||master|center|0.5"
-  "thirds|Even thirds||master|center|0.3334"
-  "left|Master left||master|left|0.5"
-  "right|Master right||master|right|0.5"
+  "center|Center master||master|center|0.5"
+  "thirds|Even thirds||master|center|0.3334"
+  "left|Master left||master|left|0.5"
+  "right|Master right||master|right|0.5"
   "dwindle|Dwindle|󰕰|dwindle||"
   "scrolling|Scrolling|󰓡|scrolling||"
 )

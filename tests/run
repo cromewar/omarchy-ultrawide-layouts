@@ -137,6 +137,17 @@ geom right 5120 0.4 2 "3072 · 2048"
 geom dwindle 5120 "" 3 "binary split"
 
 echo
+echo "Preset table — every preset carries a label and an icon"
+# The icons are private-use glyphs from the Nerd Font. They render as nothing in
+# a terminal that lacks it, so they are easy to drop while editing this table
+# and impossible to notice by eye afterwards. Assert on the bytes.
+for k in $(keys); do
+  r=$(row_for "$k")
+  check "label $k" "yes" "$([[ -n $(field "$r" 2) ]] && echo yes || echo MISSING)"
+  check "icon  $k" "yes" "$([[ -n $(field "$r" 3) ]] && echo yes || echo MISSING)"
+done
+
+echo
 if ((fail == 0)); then
   printf '\033[32m%d passed\033[0m\n\n' "$pass"
 else
