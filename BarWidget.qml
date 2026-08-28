@@ -15,7 +15,7 @@ BarWidget {
   // Resolved next to this file rather than from a fixed path, so the plugin
   // runs from wherever `omarchy plugin add` cloned it. Process wants a
   // filesystem path, and resolvedUrl hands back a file:// URL.
-  readonly property string helper: Qt.resolvedUrl("bin/hypr-layout-preset").toString().replace(/^file:\/\//, "")
+  readonly property string helper: decodeURIComponent(Qt.resolvedUrl("bin/hypr-layout-preset").toString().replace(/^file:\/\//, ""))
 
   property var presets: []
   property var state: ({})
@@ -46,24 +46,64 @@ BarWidget {
   function open() { popupOpen = true }
   function close() { popupOpen = false }
 
-  // One action process, reused. A click that lands while the previous one is
-  // still running is dropped rather than queued: the actions are all absolute
-  // ("set thirds"), so a dropped one leaves no half-applied state behind, and
-  // the refresh that follows re-reads whatever actually happened.
+  // One action process, reused.
+  //
+  // Absolute actions ("set thirds") coalesce to the last one asked for - an
+  // earlier one is worth nothing once a newer one has arrived. Scroll notches
+  // are different: they are relative, so dropping them loses distance the user
+  // asked for. A wheel flick outruns the helper easily, so notches accumulate
+  // and are spent as one larger step when the process frees up.
+  property var pendingAction: null
+  property int pendingNotches: 0
+
   function act(args) {
-    if (actionProc.running) return
+    if (actionProc.running) {
+      root.pendingAction = args
+      return
+    }
     actionProc.command = [root.helper].concat(args)
     actionProc.running = true
   }
 
-  function refresh() {
-    if (!statusProc.running) statusProc.running = true
+  function scrollBy(notches) {
+    root.pendingNotches += notches
+    root.flushScroll()
   }
 
-  Component.onCompleted: {
-    listProc.running = true
-    refresh()
+  function flushScroll() {
+    if (actionProc.running || root.pendingNotches === 0) return
+    var n = root.pendingNotches
+    root.pendingNotches = 0
+    root.act([n > 0 ? "wider" : "narrower", (Math.abs(n) * root.mfactStep).toFixed(4)])
   }
+
+  // A settle that lands while a status read is already in flight must not be
+  // thrown away: it is usually the last one, describing the arrangement that
+  // actually stuck. Dropping it is why the bar could sit showing the previous
+  // preset after a fast `next`.
+  property bool pendingRefresh: false
+
+  function refresh() {
+    if (statusProc.running) {
+      root.pendingRefresh = true
+      return
+    }
+    statusProc.running = true
+  }
+
+  // The preset catalogue only depends on which monitor the focused workspace is
+  // on and how wide it is, so it is rebuilt when that changes rather than on
+  // every window event.
+  property string listedFor: ""
+
+  function refreshList() {
+    var signature = root.monitorName + "@" + root.monitorWidth
+    if (listProc.running || signature === root.listedFor) return
+    root.listedFor = signature
+    listProc.running = true
+  }
+
+  Component.onCompleted: refresh()
 
   Process {
     id: statusProc
@@ -76,8 +116,24 @@ BarWidget {
         } catch (e) {
           root.state = ({})
         }
+        // Monitor and width are only known once status has been read.
+        root.refreshList()
       }
     }
+    onExited: {
+      if (root.pendingRefresh) {
+        root.pendingRefresh = false
+        restatus.restart()
+      }
+    }
+  }
+
+  // Same reason as `drain`: a Process cannot be restarted from inside its own
+  // onExited.
+  Timer {
+    id: restatus
+    interval: 0
+    onTriggered: root.refresh()
   }
 
   // The preset catalogue carries the widths each one gives on the focused
@@ -101,9 +157,29 @@ BarWidget {
 
   Process {
     id: actionProc
+    // Deferred by a tick: restarting the same Process from inside its own
+    // onExited is not safe.
     onExited: {
       root.refresh()
-      if (!listProc.running) listProc.running = true
+      if (root.pendingNotches !== 0 || root.pendingAction) drain.restart()
+    }
+  }
+
+  // Scroll first - it is the gesture with a finger still on it. A queued
+  // absolute action is spent afterwards, and only the newest one survives.
+  Timer {
+    id: drain
+    interval: 0
+    onTriggered: {
+      if (root.pendingNotches !== 0) {
+        root.flushScroll()
+        return
+      }
+      if (root.pendingAction) {
+        var next = root.pendingAction
+        root.pendingAction = null
+        root.act(next)
+      }
     }
   }
 
@@ -123,6 +199,14 @@ BarWidget {
       case "movewindow":
       case "movewindowv2":
       case "configreloaded":
+      // A fullscreen window makes the layout unmeasurable, floating a window
+      // removes it from the column set, and the monitor set changes the widths
+      // the picker advertises. All three left the widget showing stale numbers.
+      case "fullscreen":
+      case "changefloatingmode":
+      case "monitoradded":
+      case "monitoraddedv2":
+      case "monitorremoved":
         settle.restart()
         break
       }
@@ -130,14 +214,13 @@ BarWidget {
   }
 
   // A burst of events (closing a window moves every other one) would otherwise
-  // spawn a hyprctl chain per event.
+  // spawn a hyprctl chain per event. 120ms rather than 90: Hyprland is still
+  // settling the reflow at 90 on a busy workspace, and reading it mid-reflow is
+  // what made the bar flicker through an intermediate arrangement.
   Timer {
     id: settle
-    interval: 90
-    onTriggered: {
-      root.refresh()
-      if (!listProc.running) listProc.running = true
-    }
+    interval: 120
+    onTriggered: root.refresh()
   }
 
   implicitWidth: face.implicitWidth
@@ -167,7 +250,7 @@ BarWidget {
 
     onWheelMoved: function(delta) {
       if (!root.isMaster) return
-      root.act([delta > 0 ? "wider" : "narrower", String(root.mfactStep)])
+      root.scrollBy(delta > 0 ? 1 : -1)
     }
   }
 
@@ -313,7 +396,7 @@ BarWidget {
             tooltipText: "Narrower centre"
             foreground: root.bar ? root.bar.foreground : Color.foreground
             bordered: true
-            onClicked: root.act(["narrower", String(root.mfactStep)])
+            onClicked: root.scrollBy(-1)
           }
 
           Text {
@@ -335,7 +418,7 @@ BarWidget {
             tooltipText: "Wider centre"
             foreground: root.bar ? root.bar.foreground : Color.foreground
             bordered: true
-            onClicked: root.act(["wider", String(root.mfactStep)])
+            onClicked: root.scrollBy(1)
           }
         }
       }

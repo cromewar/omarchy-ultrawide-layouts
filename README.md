@@ -41,7 +41,13 @@ monitor the focused workspace is on.
 
 Centred orientation only engages once there are two or more slaves
 (`master:slave_count_for_center_master`), so a two-window workspace stays a plain
-50/50 split rather than squashing itself into three. Widths exclude gaps.
+50/50 split rather than squashing itself into three — and below that threshold
+the picker shows the two-column widths you will actually get, not the three it
+would give with another window open.
+
+The widths above are the ideal split of the panel. Real windows come out a little
+narrower, because `gaps_out` is taken off each edge and `gaps_in` from between
+every pair.
 
 ![Even thirds](docs/thirds.png)
 
@@ -110,11 +116,36 @@ through the `layoutmsg` dispatcher, which acts on the focused workspace — whic
 is why every action here targets the focused workspace.
 
 **The current preset is measured, not remembered.** The plugin reads
-`tiledLayout` from Hyprland and derives `mfact` from the widest tiled window on
-the workspace. So it stays correct after a manual `SUPER + ←/→` resize, a
-`SUPER + L` toggle, or a fresh session — none of which announce themselves. When
-the master has been dragged off-ratio the tooltip says `(resized)`, and one click
-on the current row puts it back.
+`tiledLayout` from Hyprland and derives `mfact` from the tiled columns. So it
+stays correct after a manual `SUPER + ←/→` resize, a `SUPER + L` toggle, or a
+fresh session — none of which announce themselves. When the master has been
+dragged off-ratio the tooltip says `(resized)`, and one click on the current row
+puts it back.
+
+The master column is identified by its **position**, not its width. That
+distinction is the whole ballgame: the master is only the widest window while
+`mfact` is above 0.5 (left/right) or 1/3 (centre). Below that the widest column
+is a *slave*, and reading it as the master gives you `1 - mfact`. `mfact` is then
+the master column over the sum of the column widths, which cancels
+`gaps_in`/`gaps_out` rather than leaving a systematic offset to be fudged later.
+
+Some states carry no ratio at all — an empty workspace, a single window, a
+fullscreen window, or a centre master below its slave threshold. There the
+plugin reports nothing rather than a confident wrong number, and the preset
+falls back to layout plus orientation, which are both still known. That is why
+closing a workspace down to one window no longer loses your place in the cycle.
+
+Orientation is the one thing that cannot be measured — `left` at `mfact 0.4` and
+`right` at `0.6` produce identical column sets — and Hyprland does not report it
+back (`hyprctl workspacerules` omits the field entirely). So it is read out of
+the rule file below, and only trusted while that file still describes the live
+layout.
+
+> **Caveat:** if you set orientation through a monitor-wide rule you wrote by
+> hand (`m[DP-3]` in `looknfeel.lua`) and the workspace has no rule file yet,
+> there is no way to read that back, and the plugin will fall back to the global
+> `master:orientation`. Applying any preset once fixes it permanently, because
+> that writes the rule file, which is sourced last and wins.
 
 Persistence goes to `~/.local/state/omarchy/workspace-layouts/<id>.lua`, the same
 directory Omarchy's own `omarchy-hyprland-workspace-layout-toggle` writes to.
@@ -123,7 +154,9 @@ loses to the other.
 
 `mfact` is the one thing that cannot survive a full Hyprland restart — a
 workspace comes back with its orientation intact but on the default `master:mfact`.
-One click on the current preset row restores it.
+One click on the current preset row restores it. Closing the master window has
+the same effect: the promoted slave becomes a fresh master node at the global
+default, so the preset stays but the ratio does not.
 
 ![Master left](docs/left.png)
 
@@ -142,10 +175,22 @@ hypr-layout-preset get            # just the preset key
 hypr-layout-preset set <key>
 hypr-layout-preset next | prev | snap
 hypr-layout-preset wider | narrower [step]
+hypr-layout-preset prune          # drop state for workspaces that no longer exist
 ```
 
 Prefix any subcommand with `--notify` to raise a desktop notification naming the
 result.
+
+## Tests
+
+The measurement is pure — it reads a probe object and returns a ratio and a
+preset key — so it is tested against captured fixtures with no compositor
+attached. Every layout the widest-window heuristic got wrong is a fixture, as
+are the ones it got right.
+
+```bash
+./tests/run     # needs only bash and jq
+```
 
 ## Requirements
 
