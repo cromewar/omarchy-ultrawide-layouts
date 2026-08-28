@@ -137,6 +137,34 @@ geom right 5120 0.4 2 "3072 · 2048"
 geom dwindle 5120 "" 3 "binary split"
 
 echo
+echo "Apply — the ratio must actually be in the chunk that set runs"
+# This is the one that got shipped broken: apply_preset took the tiled count as
+# its fifth argument and set_preset passed four, so the guard read 0 and every
+# `set` silently dropped the mfact, leaving the workspace on the global default.
+has_mfact() {
+  local lua
+  lua=$(build_apply_lua 1 "$1" "$2" "$3" "$4")
+  case "$lua" in
+  *"mfact exact $3"*) echo yes ;;
+  *) echo no ;;
+  esac
+}
+check "center carries its ratio" yes "$(has_mfact master center 0.5 3)"
+check "thirds carries its ratio" yes "$(has_mfact master center 0.3334 3)"
+check "left carries its ratio" yes "$(has_mfact master left 0.5 2)"
+check "right carries its ratio" yes "$(has_mfact master right 0.5 2)"
+check "ratio applies with 1 window" yes "$(has_mfact master center 0.5 1)"
+# ...but not on an empty workspace, where layoutmsg errors with "no window" and
+# would take the workspace rule down with it.
+check "empty workspace omits ratio" no "$(has_mfact master center 0.5 0)"
+check "dwindle has no ratio" no "$(has_mfact dwindle "" "" 3)"
+# The rule itself must survive either way.
+check "rule present, empty ws" yes \
+  "$(case "$(build_apply_lua 1 master center 0.5 0)" in *workspace_rule*) echo yes ;; *) echo no ;; esac)"
+check "orientation in rule" yes \
+  "$(case "$(build_rule_lua 1 master center)" in *'orientation = "center"'*) echo yes ;; *) echo no ;; esac)"
+
+echo
 echo "Preset table — every preset carries a label and an icon"
 # The icons are private-use glyphs from the Nerd Font. They render as nothing in
 # a terminal that lacks it, so they are easy to drop while editing this table
