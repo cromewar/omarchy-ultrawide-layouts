@@ -396,27 +396,44 @@ clamp_mfact() {
 # The rule and the ratio go out as one Lua chunk in a single `hyprctl eval`.
 # Sent as two calls, the mfact layoutmsg can land while the workspace is still
 # on the old layout — dwindle ignores it — and the ratio is silently lost.
+# The workspace rule on its own — this is what gets persisted.
+build_rule_lua() {
+  local ws="$1" layout="$2" orientation="$3"
+  if [[ -n "$orientation" ]]; then
+    printf 'hl.workspace_rule({ workspace = "%s", layout = "%s", layout_opts = { orientation = "%s" } })' \
+      "$ws" "$layout" "$orientation"
+  else
+    printf 'hl.workspace_rule({ workspace = "%s", layout = "%s" })' "$ws" "$layout"
+  fi
+}
+
+# The full chunk `set` executes: the rule, plus the ratio when there is
+# something to apply it to.
+#
+# Pure, and split out from apply_preset precisely so tests can assert the ratio
+# is actually in there. It went missing once — apply_preset took the tiled count
+# as its fifth argument and set_preset passed four, so the guard below read 0
+# and silently dropped the mfact from every `set`. Nothing caught it, because
+# the workspace under test already happened to be at the right ratio.
+build_apply_lua() {
+  local ws="$1" layout="$2" orientation="$3" mfact="$4" tiled="${5:-0}" lua
+  lua=$(build_rule_lua "$ws" "$layout" "$orientation")
+  # On an empty workspace `layoutmsg mfact` fails with "no window", and because
+  # the two share a chunk that failure would take the rule down with it — pcall
+  # does not help, hyprctl still reports the error. Nothing needs resizing there
+  # anyway, and the ratio lands when the preset is next applied.
+  if [[ -n "$mfact" ]] && ((tiled > 0)); then
+    lua="$lua; hl.dispatch(hl.dsp.layout(\"mfact exact $mfact\"))"
+  fi
+  printf '%s\n' "$lua"
+}
+
 apply_preset() {
   local ws="$1" layout="$2" orientation="$3" mfact="$4" tiled="${5:-0}" rule lua
 
-  if [[ -n "$orientation" ]]; then
-    rule=$(printf 'hl.workspace_rule({ workspace = "%s", layout = "%s", layout_opts = { orientation = "%s" } })' \
-      "$ws" "$layout" "$orientation")
-  else
-    rule=$(printf 'hl.workspace_rule({ workspace = "%s", layout = "%s" })' "$ws" "$layout")
-  fi
-
+  rule=$(build_rule_lua "$ws" "$layout" "$orientation")
   write_rule_file "$ws" "$rule"
-
-  lua="$rule"
-  # The ratio rides along in the same chunk only when there is something to
-  # apply it to. On an empty workspace `layoutmsg mfact` fails with "no window",
-  # and because the two share a chunk that failure would take the rule down with
-  # it — pcall does not help, hyprctl still reports the error. Nothing needs
-  # resizing there anyway, and the ratio lands when the preset is next applied.
-  if [[ -n "$mfact" && "$tiled" -gt 0 ]]; then
-    lua="$lua; hl.dispatch(hl.dsp.layout(\"mfact exact $mfact\"))"
-  fi
+  lua=$(build_apply_lua "$ws" "$layout" "$orientation" "$mfact" "$tiled")
 
   if hyprctl eval "$lua" >/dev/null 2>&1; then
     return 0
@@ -439,17 +456,20 @@ apply_mfact() {
 # -------------------------------------------------------------------- commands
 
 set_preset() {
-  local key="$1" probe="${2:-}" row ws layout orientation mfact
+  local key="$1" probe="${2:-}" row ws layout orientation mfact tiled
   row=$(row_for "$key") || die "unknown preset: $key (try: $(keys | paste -sd' '))"
   [[ -n "$probe" ]] || probe=$(probe)
   ws=$(jq -r '.workspace' <<<"$probe")
   valid_ws "$ws" || die "no ordinary focused workspace (got '$ws')"
+  # How many tiled windows there are to resize. Without this the ratio is
+  # dropped from every `set`.
+  tiled=$(jq -r '.tiled // 0' <<<"$probe")
 
   layout=$(field "$row" 4)
   orientation=$(field "$row" 5)
   mfact=$(field "$row" 6)
 
-  apply_preset "$ws" "$layout" "$orientation" "$mfact"
+  apply_preset "$ws" "$layout" "$orientation" "$mfact" "$tiled"
   write_state "$ws" "$key" "$mfact"
 }
 
