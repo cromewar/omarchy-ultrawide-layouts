@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Regression tests for the layout measurement.
+#
+# The measurement is the part that was wrong, and it is pure: it reads a probe
+# object and returns a ratio and a preset key. So it is tested against captured
+# fixtures with no compositor attached — every case below is a layout the old
+# widest-window heuristic got wrong, plus the cases it got right, which must
+# stay right.
+#
+# Needs only bash and jq. Run: ./tests/run
+set -uo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+fixtures="$here/fixtures"
+
+# shellcheck source=../bin/hypr-layout-preset
+source "$here/../bin/hypr-layout-preset"
+
+pass=0
+fail=0
+
+check() {
+  local name="$1" expected="$2" actual="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    printf '  \033[32mok\033[0m    %-30s %s\n' "$name" "$actual"
+    pass=$((pass + 1))
+  else
+    printf '  \033[31mFAIL\033[0m  %-30s expected %-10s got %s\n' "$name" "$expected" "$actual"
+    fail=$((fail + 1))
+  fi
+}
+
+# measure <fixture> <orientation> <expected mfact, or "-" for unmeasurable>
+measure() {
+  local got
+  got=$(measure_mfact "$2" 2 <"$fixtures/$1.json")
+  check "mfact $1/$2" "$3" "${got:--}"
+}
+
+# key <fixture> <orientation> <stored mfact> <expected key> [stored key]
+key() {
+  local got
+  got=$(resolve_key "$2" 2 "$3" "${5:-}" <"$fixtures/$1.json")
+  check "key   $1/$2${5:+ [$5]}" "$4" "$got"
+}
+
+# geometry <key> <width> <mfact> <columns> <expected>
+geom() {
+  check "geom  $1@$4col" "$5" "$(geometry_for "$1" "$2" "$3" "$4" 2)"
+}
+
+echo
+echo "Measurement — cases the widest-window heuristic got WRONG"
+# Below mfact 0.5 the slave is the widest column, so the old code returned the
+# slave's share. These are the regressions that made `narrower` oscillate.
+measure left-2win-040 left 0.4
+measure left-2win-030 left 0.3
+measure right-2win-040 right 0.4
+measure center-3win-025 center 0.25
+
+echo
+echo "Measurement — cases that already worked, and must not regress"
+measure center-3win center 0.5
+measure left-2win-050 left 0.5
+measure thirds-3win center 0.3335
+
+echo
+echo "Measurement — gaps must cancel"
+# Dividing by monitor width read 0.495 here; dividing by the column span reads
+# the real ratio, which is why the fudge tolerance could be dropped.
+measure center-3win-gaps center 0.5004
+
+echo
+echo "Measurement — degenerate states report nothing, never a number"
+measure one-window center -
+measure one-window left -
+measure fullscreen center -
+measure empty-ws center -
+measure center-2col center - # centre master has not engaged below its slave threshold
+
+echo
+echo "Measurement — sanity gates refuse rather than answer confidently"
+# A fullscreen window's column drops out of the set, so what is left no longer
+# spans the workspace: filtering it would produce a confident wrong ratio.
+measure fullscreen-with-cols center -
+measure fullscreen-with-cols left -
+# The master layout yields 2 columns (left/right) or 3 (centre, engaged), never
+# more; and one column holding a stack means the split is on the other axis.
+measure four-columns left -
+measure one-col-stacked left -
+
+echo
+echo "Preset identity — degenerate states keep their place in the cycle"
+# The old code ran a nearest-mfact search over every master preset, so a
+# one-window workspace measured ~0.996 and always resolved to "center",
+# silently losing whichever preset you were actually on.
+key one-window center 0.5 center
+key one-window center 0.3334 thirds
+key one-window left 0.5 left
+key one-window right 0.5 right
+key fullscreen right 0.5 right
+key empty-ws left 0.5 left
+
+echo
+echo "Preset identity — measured"
+key center-3win center 0.5 center
+key thirds-3win center 0.5 thirds
+key left-2win-040 left 0.5 left
+key right-2win-040 right 0.5 right
+key center-3win-025 center 0.5 thirds
+
+echo
+echo "Preset identity — hysteresis keeps a drag from relabelling itself"
+# 0.40 is one scroll notch past the centre/thirds midpoint (0.4167). With no
+# stored preset the nearest ratio wins and it reads as thirds; with centre
+# stored, it stays centre so that middle-click still snaps back where the user
+# came from.
+key center-3win-040 center 0.5 thirds
+key center-3win-040 center 0.5 center center
+key center-3win-040 center 0.5 thirds thirds
+# Hysteresis must not drag a reading across a real change.
+key center-3win center 0.5 center thirds
+key thirds-3win center 0.5 thirds center
+
+echo
+echo "Preset identity — non-master layouts pass through"
+key dwindle left 0.5 dwindle
+key scrolling left 0.5 scrolling
+
+echo
+echo "Geometry — centre master only claims three columns once it has engaged"
+geom center 5120 0.5 3 "1280 · 2560 · 1280"
+geom center 5120 0.5 2 "2560 · 2560"
+geom thirds 5120 0.3334 3 "1706 · 1707 · 1706"
+geom left 5120 0.4 2 "2048 · 3072"
+geom right 5120 0.4 2 "3072 · 2048"
+geom dwindle 5120 "" 3 "binary split"
+
+echo
+if ((fail == 0)); then
+  printf '\033[32m%d passed\033[0m\n\n' "$pass"
+else
+  printf '\033[31m%d passed, %d failed\033[0m\n\n' "$pass" "$fail"
+fi
+exit $((fail > 0))

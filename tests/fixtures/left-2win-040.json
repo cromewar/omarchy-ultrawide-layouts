@@ -1,0 +1,21 @@
+{
+  "workspace": 1,
+  "monitor": "DP-3",
+  "width": 5120,
+  "layout": "master",
+  "windows": 2,
+  "hasfullscreen": false,
+  "center_threshold": 2,
+  "global_orientation": "left",
+  "columns": [
+    {
+      "x": 0,
+      "w": 2048
+    },
+    {
+      "x": 2048,
+      "w": 3072
+    }
+  ],
+  "span": 5120
+}
