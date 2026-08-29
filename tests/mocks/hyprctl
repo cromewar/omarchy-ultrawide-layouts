@@ -26,6 +26,13 @@ case "${1:-}" in
   activeworkspace)
     printf '{"id":1}\n'
     ;;
+  activewindow)
+    if [[ -n "${MOCK_ACTIVEWINDOW_BEFORE:-}" ]]; then
+      printf '%s\n' "$MOCK_ACTIVEWINDOW_BEFORE"
+    else
+      printf '%s\n' '{"address":"0x1","workspace":{"id":1},"at":[0,0],"size":[300,800]}'
+    fi
+    ;;
   eval)
     if [[ "$*" == *begin_capture* ]] &&
         grep -Fq 'lua:cromewar-ultrawide-lock' "$XDG_STATE_HOME/omarchy/workspace-layouts/1.lua" 2>/dev/null; then

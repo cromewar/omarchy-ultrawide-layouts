@@ -16,11 +16,12 @@ omarchy plugin add https://github.com/cromewar/omarchy-ultrawide-layouts.git --e
 ~/.config/omarchy/plugins/cromewar.ultrawide-layouts/bin/hypr-layout-preset setup
 ```
 
-The first command adds the bar widget. `setup` enables stable layout slots and
-binds their toggle to `SUPER + ALT + L`. It checks for a conflicting binding,
-backs up both files it touches, reloads Hyprland, and rolls the edit back if the
-reload reports an error. Use a different free chord with
-`setup --key "SUPER + CTRL + L"`.
+The first command adds the bar widget. `setup` enables stable layout slots,
+binds their toggle to `SUPER + ALT + L`, and conditionally extends Omarchy's
+existing `SUPER + SHIFT + Arrow` window-swap bindings. It checks for a
+conflicting lock binding, backs up both files it touches, reloads Hyprland, and
+rolls the edit back if the reload reports an error. Use a different free chord
+with `setup --key "SUPER + CTRL + L"`.
 
 The icon appears in the left section of your bar; move it with
 `omarchy bar move cromewar.ultrawide-layouts --section right`.
@@ -78,6 +79,7 @@ every pair.
 | click the current row | same as snap |
 | `<` `>` in the picker | grow / shrink the master column |
 | dedicated lock icon / `SUPER + ALT + L` | toggle stable layout slots |
+| `SUPER + SHIFT + Arrow` | swap windows, or expand into an adjacent locked vacancy |
 
 The picker header names the workspace, its monitor, and that monitor's width, so
 the numbers next to each preset are the widths you will actually get.
@@ -122,8 +124,10 @@ Changing a preset while locked unlocks the workspace and applies the selected
 preset. Resizing and snap controls are disabled until you unlock. Hyprland's
 normal `SUPER + SHIFT + Arrow` bindings remain active while locked: explicitly
 swapping two windows also swaps their saved slots, including positions within
-the dynamic stack. Automatic close/open events still preserve every other
-window's slot.
+the dynamic stack. If the focused fixed slot directly borders a rectangular
+vacancy in that direction, expansion takes priority and the focused window
+consumes it. Additional adjacent vacancies can be consumed one press at a time.
+Automatic close/open events still preserve every other window's slot.
 
 A regular `hyprctl reload` keeps the lock. A full Hyprland restart deliberately
 restores the underlying preset: window identities do not survive a compositor
@@ -132,8 +136,12 @@ slots. The saved lock is then treated as stale and can be removed by `prune`.
 
 ## Keybindings
 
-The explicit `setup` command installs only the lock toggle, on
-`SUPER + ALT + L` by default. Preset bindings remain opt-in. To put the preset
+The explicit `setup` command installs the lock toggle on `SUPER + ALT + L` by
+default. It also replaces Omarchy's four stock `SUPER + SHIFT + Arrow` swap
+bindings with conditional wrappers: unlocked workspaces behave normally;
+locked workspaces first try to expand into an adjacent vacancy, then fall back
+to the same Hyprland swap action. `teardown` removes those wrappers and restores
+the stock bindings on reload. Preset bindings remain opt-in. To put the preset
 cycle on `SUPER + L` (replacing Omarchy's dwindle/scrolling toggle), add this to
 `~/.config/hypr/bindings.lua`:
 
@@ -221,8 +229,10 @@ gaps, then stores normalized geometry in
 `~/.local/state/omarchy/layout-locks/<id>.lua`. Normalizing against the usable
 workspace area means the shape scales when the monitor resolution, scale, or
 reserved bar area changes. Closing a fixed window leaves its slot vacant and
-the next new window reuses that exact slot. Dynamic assignments are removed and
-restacked inside the selected dynamic column.
+the next new window reuses that exact slot. A focused fixed window can instead
+consume a directly adjacent rectangular vacancy with `SUPER + SHIFT + Arrow`.
+Dynamic assignments are removed and restacked inside the selected dynamic
+column.
 
 The generated workspace rule includes the compositor's instance signature. On a
 config reload the signature still matches and the custom layout reloads its
@@ -256,6 +266,7 @@ hypr-layout-preset wider | narrower [step]
 hypr-layout-preset lock | unlock | toggle-lock
 hypr-layout-preset recapture-lock
 hypr-layout-preset dynamic-focused
+hypr-layout-preset directional <left|right|up|down>
 hypr-layout-preset setup [--key "SUPER + ALT + L"]
 hypr-layout-preset teardown
 hypr-layout-preset prune          # drop state for workspaces that no longer exist
@@ -268,10 +279,10 @@ result.
 
 The measurement suite uses captured compositor fixtures. The Lua provider has a
 mocked layout context covering capture, vacancies, compaction, dynamic-column
-reassignment, intentional directional swaps, reload handoffs, scaling,
-workspace isolation, and stale sessions. Setup and lock lifecycle tests run
-with a temporary home and mocked Hyprland, so they never touch the live desktop
-config.
+reassignment, intentional directional swaps, vacancy expansion, reload
+handoffs, scaling, workspace isolation, and stale sessions. Setup and lock
+lifecycle tests run with a temporary home and mocked Hyprland, so they never
+touch the live desktop config.
 
 ```bash
 ./tests/run     # needs bash, jq, and lua
