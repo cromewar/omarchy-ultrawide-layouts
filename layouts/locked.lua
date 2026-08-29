@@ -46,11 +46,8 @@ local function denormalized(box, area)
   }
 end
 
-local function target_id(target)
-  local window = target.window
-  if not window then
-    return "target:" .. tostring(target.index)
-  end
+local function window_id(window, fallback)
+  if not window then return "target:" .. tostring(fallback or "unknown") end
   -- A group is one tiled target. Its active member can change without the
   -- target moving, so identify the group object rather than whichever member
   -- happens to be exposed as target.window right now.
@@ -60,7 +57,11 @@ local function target_id(target)
   if window.address and window.address ~= "" then
     return tostring(window.address)
   end
-  return "stable:" .. tostring(window.stable_id or target.index)
+  return "stable:" .. tostring(window.stable_id or fallback or "unknown")
+end
+
+local function target_id(target)
+  return window_id(target.window, target.index)
 end
 
 local function workspace_id(ctx)
@@ -162,6 +163,163 @@ local function capture_box(state, target, area)
   end
 end
 
+local function snapshot_workspace(ws)
+  if not hl or not hl.get_workspace_windows then return nil end
+  local ok, windows = pcall(hl.get_workspace_windows, ws)
+  if not ok or type(windows) ~= "table" then return nil end
+  local snapshot = {}
+  for _, window in ipairs(windows) do
+    local at, size = window.at, window.size
+    if window.mapped and not window.floating and (window.fullscreen or 0) == 0 and
+        at and size and at.x and at.y and size.x and size.y then
+      local id = window_id(window)
+      local existing = snapshot[id]
+      -- Groups expose every member here but only one layout target. Prefer its
+      -- visible member; all members normally share the same visual rectangle.
+      if not existing or (existing.hidden and not window.hidden) then
+        snapshot[id] = {
+          x = at.x,
+          y = at.y,
+          w = size.x,
+          h = size.y,
+          hidden = window.hidden or false,
+        }
+      end
+    end
+  end
+  return next(snapshot) and snapshot or nil
+end
+
+local function workspace_target_ids(ws)
+  if not hl or not hl.get_workspace_windows then return nil end
+  local ok, windows = pcall(hl.get_workspace_windows, ws)
+  if not ok or type(windows) ~= "table" then return nil end
+  local present = {}
+  for _, window in ipairs(windows) do
+    if window.mapped and not window.floating and (window.fullscreen or 0) == 0 then
+      present[window_id(window)] = true
+    end
+  end
+  return present
+end
+
+local function overlaps(a1, a2, b1, b2)
+  return math.min(a2, b2) - math.max(a1, b1) > 1
+end
+
+local function neighbor_edge(box, boxes, side)
+  local chosen
+  for _, other in pairs(boxes) do
+    if other ~= box then
+      if side == "left" and other.x + other.w <= box.x + COLUMN_TOLERANCE and
+          overlaps(other.y, other.y + other.h, box.y, box.y + box.h) then
+        chosen = chosen and math.max(chosen, other.x + other.w) or (other.x + other.w)
+      elseif side == "right" and other.x >= box.x + box.w - COLUMN_TOLERANCE and
+          overlaps(other.y, other.y + other.h, box.y, box.y + box.h) then
+        chosen = chosen and math.min(chosen, other.x) or other.x
+      elseif side == "top" and other.y + other.h <= box.y + COLUMN_TOLERANCE and
+          overlaps(other.x, other.x + other.w, box.x, box.x + box.w) then
+        chosen = chosen and math.max(chosen, other.y + other.h) or (other.y + other.h)
+      elseif side == "bottom" and other.y >= box.y + box.h - COLUMN_TOLERANCE and
+          overlaps(other.x, other.x + other.w, box.x, box.x + box.w) then
+        chosen = chosen and math.min(chosen, other.y) or other.y
+      end
+    end
+  end
+  return chosen
+end
+
+local function configured_inner_gaps()
+  local result = { top = 0, right = 0, bottom = 0, left = 0 }
+  if not hl or not hl.get_config then return result end
+  local ok, value = pcall(hl.get_config, "general.gaps_in")
+  if not ok or type(value) ~= "table" then return result end
+  for side in pairs(result) do result[side] = tonumber(value[side]) or 0 end
+  return result
+end
+
+local function prepare_snapshot(state, area, seed)
+  local boxes = state.snapshot
+  if not boxes then return false end
+
+  local min_x, min_y, max_x, max_y
+  for _, box in pairs(boxes) do
+    min_x = min_x and math.min(min_x, box.x) or box.x
+    min_y = min_y and math.min(min_y, box.y) or box.y
+    max_x = max_x and math.max(max_x, box.x + box.w) or (box.x + box.w)
+    max_y = max_y and math.max(max_y, box.y + box.h) or (box.y + box.h)
+  end
+
+  local gaps = configured_inner_gaps()
+  local inset = {
+    left = math.max(0, min_x - area.x),
+    top = math.max(0, min_y - area.y),
+    right = math.max(0, area.x + area.w - max_x),
+    bottom = math.max(0, area.y + area.h - max_y),
+  }
+
+  -- The first target transferred by Hyprland still has its original logical
+  -- box. Use it to separate client borders/reserved space from gaps precisely.
+  if seed then
+    local visual = boxes[target_id(seed)]
+    local logical = seed.box
+    if visual and logical then
+      local touches_left = math.abs(logical.x - area.x) <= COLUMN_TOLERANCE
+      local touches_top = math.abs(logical.y - area.y) <= COLUMN_TOLERANCE
+      local touches_right = math.abs(logical.x + logical.w - area.x - area.w) <= COLUMN_TOLERANCE
+      local touches_bottom = math.abs(logical.y + logical.h - area.y - area.h) <= COLUMN_TOLERANCE
+      inset.left = math.max(0, visual.x - logical.x - (touches_left and 0 or gaps.left))
+      inset.top = math.max(0, visual.y - logical.y - (touches_top and 0 or gaps.top))
+      inset.right = math.max(0, logical.x + logical.w - visual.x - visual.w -
+        (touches_right and 0 or gaps.right))
+      inset.bottom = math.max(0, logical.y + logical.h - visual.y - visual.h -
+        (touches_bottom and 0 or gaps.bottom))
+    end
+  end
+
+  local logical_boxes = {}
+  for id, box in pairs(boxes) do
+    local left_neighbor = neighbor_edge(box, boxes, "left")
+    local right_neighbor = neighbor_edge(box, boxes, "right")
+    local top_neighbor = neighbor_edge(box, boxes, "top")
+    local bottom_neighbor = neighbor_edge(box, boxes, "bottom")
+
+    local left = area.x
+    if left_neighbor then
+      left = ((box.x - gaps.left - inset.left) +
+        (left_neighbor + gaps.right + inset.right)) / 2
+    end
+    local right = area.x + area.w
+    if right_neighbor then
+      right = ((box.x + box.w + gaps.right + inset.right) +
+        (right_neighbor - gaps.left - inset.left)) / 2
+    end
+    local top = area.y
+    if top_neighbor then
+      top = ((box.y - gaps.top - inset.top) +
+        (top_neighbor + gaps.bottom + inset.bottom)) / 2
+    end
+    local bottom = area.y + area.h
+    if bottom_neighbor then
+      bottom = ((box.y + box.h + gaps.bottom + inset.bottom) +
+        (bottom_neighbor - gaps.top - inset.top)) / 2
+    end
+    logical_boxes[id] = normalized({ x = left, y = top, w = right - left, h = bottom - top }, area)
+  end
+
+  local order = sorted_keys(logical_boxes)
+  table.sort(order, function(a, b)
+    local aa, bb = logical_boxes[a], logical_boxes[b]
+    if math.abs(aa.x - bb.x) > 0.0001 then return aa.x < bb.x end
+    if math.abs(aa.y - bb.y) > 0.0001 then return aa.y < bb.y end
+    return a < b
+  end)
+  state.capture = logical_boxes
+  state.capture_order = order
+  state.snapshot = nil
+  return true
+end
+
 local function union_boxes(ids, boxes)
   local x1, y1, x2, y2
   for _, id in ipairs(ids) do
@@ -204,6 +362,7 @@ local function finalize_capture(state, area)
   state.dynamic_box = union_boxes(dynamic and dynamic.ids or {}, state.capture)
   state.assignments = {}
   state.dynamic_order = {}
+  state.vacancies = {}
 
   for column_index, column in ipairs(columns) do
     for _, id in ipairs(column.ids) do
@@ -223,14 +382,21 @@ local function finalize_capture(state, area)
   state.capture = nil
   state.capture_order = nil
   state.expected = nil
+  state.seen = nil
+  state.snapshot = nil
   state.area = normalized(area, area)
   persist_or_error(state)
 end
 
-local function begin_request(ws, expected, session)
+local function begin_request(ws, expected, session, snapshot)
   ws = tonumber(ws)
   expected = tonumber(expected)
   if not ws or not expected or expected < 1 then return false end
+  snapshot = snapshot or snapshot_workspace(ws)
+  if snapshot then
+    expected = 0
+    for _ in pairs(snapshot) do expected = expected + 1 end
+  end
   states[ws] = nil
   requests[ws] = {
     version = VERSION,
@@ -239,6 +405,8 @@ local function begin_request(ws, expected, session)
     expected = expected,
     capture = {},
     capture_order = {},
+    snapshot = snapshot,
+    seen = {},
   }
   return true
 end
@@ -255,13 +423,31 @@ end
 
 local function place_state(ctx, state)
   local live, by_id = live_target_map(ctx)
+  -- During a config reload Hyprland transfers targets into the newly created
+  -- custom algorithm one at a time. The workspace query distinguishes a real
+  -- close from a target that simply has not reached this callback yet.
+  local present = workspace_target_ids(state.workspace) or live
   local changed = false
+  state.vacancies = state.vacancies or {}
 
-  -- Dynamic members are ephemeral. Fixed assignments deliberately are not:
-  -- their vacancy is the feature this layout provides.
+  -- Keep the geometry of a closed fixed target as a reusable vacancy. This
+  -- preserves the empty slot now and lets the next new window fill that same
+  -- left/center position rather than being diverted to the dynamic column.
+  for id, assignment in pairs(state.assignments) do
+    if assignment.kind == "fixed" and not present[id] then
+      state.vacancies[#state.vacancies + 1] = {
+        zone = assignment.zone,
+        box = assignment.box,
+      }
+      state.assignments[id] = nil
+      changed = true
+    end
+  end
+
+  -- Dynamic members compact inside their shared zone when one closes.
   local next_order = {}
   for _, id in ipairs(state.dynamic_order or {}) do
-    if live[id] then
+    if present[id] then
       next_order[#next_order + 1] = id
     else
       state.assignments[id] = nil
@@ -270,12 +456,22 @@ local function place_state(ctx, state)
   end
   state.dynamic_order = next_order
 
-  -- A window unknown to the capture always joins the dynamic column.
+  -- Reuse fixed vacancies first. With none left, a new window joins the
+  -- dynamic column and stacks there with any existing dynamic members.
   for _, target in ipairs(ctx.targets) do
     local id = target_id(target)
     if not state.assignments[id] then
-      state.assignments[id] = { kind = "dynamic", zone = state.dynamic_zone }
-      state.dynamic_order[#state.dynamic_order + 1] = id
+      if #state.vacancies > 0 then
+        local vacancy = table.remove(state.vacancies, 1)
+        state.assignments[id] = {
+          kind = "fixed",
+          zone = vacancy.zone,
+          box = vacancy.box,
+        }
+      else
+        state.assignments[id] = { kind = "dynamic", zone = state.dynamic_zone }
+        state.dynamic_order[#state.dynamic_order + 1] = id
+      end
       changed = true
     end
   end
@@ -329,16 +525,26 @@ function M.recalculate(ctx)
 
   local request = requests[ws]
   if request then
-    for _, target in ipairs(ctx.targets) do capture_box(request, target, ctx.area) end
-    if #request.capture_order >= request.expected then
+    if request.snapshot then prepare_snapshot(request, ctx.area, ctx.targets[1]) end
+    for _, target in ipairs(ctx.targets) do
+      request.seen[target_id(target)] = true
+      capture_box(request, target, ctx.area)
+    end
+    local seen = 0
+    for _ in pairs(request.seen) do seen = seen + 1 end
+    if seen >= request.expected then
       requests[ws] = nil
       states[ws] = request
       finalize_capture(request, ctx.area)
       place_state(ctx, request)
     else
       -- Until Hyprland has transferred the final target, leave each target in
-      -- the logical box supplied by the previous layout.
-      for _, target in ipairs(ctx.targets) do target:place(copy_box(target.box)) end
+      -- the logical box snapshotted before the old layout began removing and
+      -- rearranging its remaining targets.
+      for _, target in ipairs(ctx.targets) do
+        local box = request.capture[target_id(target)]
+        target:place(box and denormalized(box, ctx.area) or copy_box(target.box))
+      end
     end
     return
   end
@@ -412,8 +618,8 @@ function M.layout_msg(ctx, message)
   return "unknown layout lock command: " .. tostring(message)
 end
 
-function M.begin_capture(ws, expected, session)
-  return begin_request(ws, expected, session)
+function M.begin_capture(ws, expected, session, snapshot)
+  return begin_request(ws, expected, session, snapshot)
 end
 
 function M.cancel_capture(ws)

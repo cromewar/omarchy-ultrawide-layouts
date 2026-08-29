@@ -212,12 +212,14 @@ Sharing it is deliberate: both tools write the same file, so neither silently
 loses to the other.
 
 Stable slots use a small Hyprland Lua layout loaded by `setup`. The provider
-captures Hyprland's logical boxes while it switches from the current algorithm,
-then stores normalized geometry in
+snapshots every tiled window before Hyprland starts switching algorithms,
+reconstructs the same logical boxes from those visual rectangles and the active
+gaps, then stores normalized geometry in
 `~/.local/state/omarchy/layout-locks/<id>.lua`. Normalizing against the usable
 workspace area means the shape scales when the monitor resolution, scale, or
-reserved bar area changes. Fixed assignments remain after their window closes;
-dynamic assignments are removed and restacked.
+reserved bar area changes. Closing a fixed window leaves its slot vacant and
+the next new window reuses that exact slot. Dynamic assignments are removed and
+restacked inside the selected dynamic column.
 
 The generated workspace rule includes the compositor's instance signature. On a
 config reload the signature still matches and the custom layout reloads its

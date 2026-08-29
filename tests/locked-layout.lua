@@ -61,13 +61,27 @@ layout._reset()
 local handoff_left = target("0x20", 10, box(0, 0, 300, 800))
 local handoff_center = target("0x21", 10, box(300, 0, 600, 800))
 local handoff_right = target("0x22", 10, box(900, 0, 300, 800))
-layout.begin_capture(10, 3, os.getenv("HYPRLAND_INSTANCE_SIGNATURE") or "")
+local real_hl = hl
+hl = { get_config = function() return { top = 5, right = 5, bottom = 5, left = 5 } end }
+local visual_snapshot = {
+  ["0x20"] = box(2, 2, 291, 796),
+  ["0x21"] = box(307, 2, 586, 796),
+  ["0x22"] = box(907, 2, 291, 796),
+}
+layout.begin_capture(10, 3, os.getenv("HYPRLAND_INSTANCE_SIGNATURE") or "", visual_snapshot)
 layout.recalculate(context(area, { handoff_left }))
 equal("partial handoff does not finalize", nil, layout._state(10))
+handoff_center.box = box(0, 0, 600, 800)
 layout.recalculate(context(area, { handoff_left, handoff_center }))
 equal("second partial handoff stays pending", nil, layout._state(10))
+equal("transfer-time reflow cannot move center", 300, handoff_center.box.x)
+handoff_right.box = box(600, 0, 600, 800)
 layout.recalculate(context(area, { handoff_left, handoff_center, handoff_right }))
 equal("final transferred target commits capture", 3, layout._state(10).column_count)
+equal("snapshot preserves left width", 300, handoff_left.box.w)
+equal("snapshot preserves center box", 600, handoff_center.box.w)
+equal("snapshot preserves right x", 900, handoff_right.box.x)
+hl = real_hl
 
 io.write("\nLayout lock — capture and fixed vacancies\n")
 layout._reset()
@@ -84,6 +98,49 @@ layout.recalculate(context(area, { left, center }))
 equal("closed dynamic leaves right vacant", 900, center.box.x + center.box.w)
 equal("fixed center keeps x", 300, center.box.x)
 equal("fixed center keeps width", 600, center.box.w)
+
+io.write("\nLayout lock — fixed vacancies are reusable\n")
+layout._reset()
+local vacancy_left = target("0x41", 11, box(0, 0, 300, 800))
+local vacancy_center = target("0x42", 11, box(300, 0, 600, 800))
+local vacancy_right = target("0x43", 11, box(900, 0, 300, 800))
+local vacancy_state = capture(11, { vacancy_left, vacancy_center, vacancy_right }, area)
+layout.recalculate(context(area, { vacancy_left, vacancy_right }))
+equal("closing center leaves right in place", 900, vacancy_right.box.x)
+equal("closing center records one vacancy", 1, #vacancy_state.vacancies)
+local center_replacement = target("0x44", 11, box(0, 0, 1, 1))
+layout.recalculate(context(area, { vacancy_left, center_replacement, vacancy_right }))
+equal("new window fills center vacancy x", 300, center_replacement.box.x)
+equal("new window fills center vacancy width", 600, center_replacement.box.w)
+equal("replacement is fixed in reused slot", "fixed", vacancy_state.assignments["0x44"].kind)
+layout.recalculate(context(area, { center_replacement, vacancy_right }))
+local left_replacement = target("0x45", 11, box(0, 0, 1, 1))
+layout.recalculate(context(area, { left_replacement, center_replacement, vacancy_right }))
+equal("new window fills left vacancy", 0, left_replacement.box.x)
+equal("right stays put through vacancy reuse", 900, vacancy_right.box.x)
+
+io.write("\nLayout lock — config reload handoff is not a close\n")
+layout._reset()
+local reload_left = target("0x51", 12, box(0, 0, 300, 800))
+local reload_center = target("0x52", 12, box(300, 0, 600, 800))
+local reload_right = target("0x53", 12, box(900, 0, 300, 800))
+local reload_state = capture(12, { reload_left, reload_center, reload_right }, area)
+for _, reload_target in ipairs({ reload_left, reload_center, reload_right }) do
+  reload_target.window.mapped = true
+  reload_target.window.floating = false
+  reload_target.window.fullscreen = 0
+end
+real_hl = hl
+hl = {
+  get_workspace_windows = function()
+    return { reload_left.window, reload_center.window, reload_right.window }
+  end,
+}
+layout.recalculate(context(area, { reload_left }))
+equal("partial reload keeps unseen center assignment", "fixed", reload_state.assignments["0x52"].kind)
+equal("partial reload keeps unseen dynamic assignment", "dynamic", reload_state.assignments["0x53"].kind)
+equal("partial reload creates no false vacancy", 0, #reload_state.vacancies)
+hl = real_hl
 
 io.write("\nLayout lock — groups are one stable target\n")
 layout._reset()
