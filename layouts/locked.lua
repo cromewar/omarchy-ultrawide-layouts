@@ -238,7 +238,7 @@ local function configured_inner_gaps()
   return result
 end
 
-local function prepare_snapshot(state, area, seed)
+local function prepare_snapshot(state, area)
   local boxes = state.snapshot
   if not boxes then return false end
 
@@ -257,25 +257,6 @@ local function prepare_snapshot(state, area, seed)
     right = math.max(0, area.x + area.w - max_x),
     bottom = math.max(0, area.y + area.h - max_y),
   }
-
-  -- The first target transferred by Hyprland still has its original logical
-  -- box. Use it to separate client borders/reserved space from gaps precisely.
-  if seed then
-    local visual = boxes[target_id(seed)]
-    local logical = seed.box
-    if visual and logical then
-      local touches_left = math.abs(logical.x - area.x) <= COLUMN_TOLERANCE
-      local touches_top = math.abs(logical.y - area.y) <= COLUMN_TOLERANCE
-      local touches_right = math.abs(logical.x + logical.w - area.x - area.w) <= COLUMN_TOLERANCE
-      local touches_bottom = math.abs(logical.y + logical.h - area.y - area.h) <= COLUMN_TOLERANCE
-      inset.left = math.max(0, visual.x - logical.x - (touches_left and 0 or gaps.left))
-      inset.top = math.max(0, visual.y - logical.y - (touches_top and 0 or gaps.top))
-      inset.right = math.max(0, logical.x + logical.w - visual.x - visual.w -
-        (touches_right and 0 or gaps.right))
-      inset.bottom = math.max(0, logical.y + logical.h - visual.y - visual.h -
-        (touches_bottom and 0 or gaps.bottom))
-    end
-  end
 
   local logical_boxes = {}
   for id, box in pairs(boxes) do
@@ -525,7 +506,7 @@ function M.recalculate(ctx)
 
   local request = requests[ws]
   if request then
-    if request.snapshot then prepare_snapshot(request, ctx.area, ctx.targets[1]) end
+    if request.snapshot then prepare_snapshot(request, ctx.area) end
     for _, target in ipairs(ctx.targets) do
       request.seen[target_id(target)] = true
       capture_box(request, target, ctx.area)
