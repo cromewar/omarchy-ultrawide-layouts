@@ -77,7 +77,7 @@ every pair.
 | scroll | grow / shrink the master column |
 | click the current row | same as snap |
 | `<` `>` in the picker | grow / shrink the master column |
-| lock button / `SUPER + ALT + L` | toggle stable layout slots |
+| dedicated lock icon / `SUPER + ALT + L` | toggle stable layout slots |
 
 The picker header names the workspace, its monitor, and that monitor's width, so
 the numbers next to each preset are the widths you will actually get.
@@ -104,9 +104,9 @@ OBS (fixed)  |  streamed app (fixed)  |  dynamic tools
 ```
 
 Closing a tool on the right does not move OBS or the streamed app. Open another
-tool and it fills the dynamic column. The lock card in the picker provides:
+tool and it fills the dynamic column. The bar always shows a dedicated
+locked/unlocked button, and the picker contains a labeled on/off switch plus:
 
-- **Unlock** — return to the underlying preset.
 - **Recapture** — replace the saved slots with the boxes currently on screen.
 - **Make focused column dynamic** — move dynamic behavior to the column that
   contains the focused tiled window.

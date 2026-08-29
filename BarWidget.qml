@@ -228,36 +228,60 @@ BarWidget {
     onTriggered: root.refresh()
   }
 
-  implicitWidth: face.implicitWidth
-  implicitHeight: face.implicitHeight
+  implicitWidth: barControls.implicitWidth
+  implicitHeight: barControls.implicitHeight
 
-  WidgetButton {
-    id: face
-    anchors.fill: parent
-    bar: root.bar
-    text: (root.showLabel && !root.vertical && root.presetLabel !== ""
-      ? root.presetIcon + "  " + root.presetLabel
-      : root.presetIcon) + (root.locked ? "  󰌾" : "")
-    fontSize: root.showLabel && !root.vertical ? Style.font.body : Style.font.icon
-    horizontalMargin: 7
-    active: root.popupOpen
-    // The popup is the detail view; a tooltip on top of it would fight it.
-    tooltipText: root.popupOpen ? "" : (
-      root.presetLabel
-        + (root.geometry !== "" ? "   " + root.geometry : "")
-        + (root.locked ? "   Locked" : (root.snapped ? "" : "   (resized)")))
+  Grid {
+    id: barControls
+    columns: root.vertical ? 1 : 2
+    spacing: 0
 
-    onPressed: function(button) {
-      if (button === Qt.RightButton) root.act(["next"])
-      else if (button === Qt.MiddleButton) {
-        if (!root.locked) root.act(["snap"])
+    WidgetButton {
+      id: face
+      bar: root.bar
+      text: root.showLabel && !root.vertical && root.presetLabel !== ""
+        ? root.presetIcon + "  " + root.presetLabel
+        : root.presetIcon
+      fontSize: root.showLabel && !root.vertical ? Style.font.body : Style.font.icon
+      horizontalMargin: 7
+      active: root.popupOpen
+      // The popup is the detail view; a tooltip on top of it would fight it.
+      tooltipText: root.popupOpen ? "" : (
+        root.presetLabel
+          + (root.geometry !== "" ? "   " + root.geometry : "")
+          + (root.locked ? "   Locked" : (root.snapped ? "" : "   (resized)")))
+
+      onPressed: function(button) {
+        if (button === Qt.RightButton) root.act(["next"])
+        else if (button === Qt.MiddleButton) {
+          if (!root.locked) root.act(["snap"])
+        }
+        else root.popupOpen = !root.popupOpen
       }
-      else root.popupOpen = !root.popupOpen
+
+      onWheelMoved: function(delta) {
+        if (!root.isMaster || root.locked) return
+        root.scrollBy(delta > 0 ? 1 : -1)
+      }
     }
 
-    onWheelMoved: function(delta) {
-      if (!root.isMaster || root.locked) return
-      root.scrollBy(delta > 0 ? 1 : -1)
+    // Always visible, so both the current state and the toggle affordance are
+    // obvious without opening the preset picker.
+    WidgetButton {
+      id: lockFace
+      bar: root.bar
+      text: root.locked ? "󰌾" : "󰌿"
+      fontSize: Style.font.icon
+      horizontalMargin: 5
+      active: root.locked
+      dimmed: !root.locked
+      interactive: root.locked || root.lockSupported
+      tooltipText: root.locked
+        ? "Window positions locked · click to unlock"
+        : (root.lockSupported ? "Lock window positions" : root.lockReason)
+      onPressed: function(button) {
+        if (button === Qt.LeftButton) root.act(["toggle-lock"])
+      }
     }
   }
 
@@ -287,102 +311,46 @@ BarWidget {
         elide: Text.ElideRight
       }
 
-      BorderSurface {
-        id: lockCard
+      Toggle {
+        id: lockToggle
         width: parent.width
-        implicitHeight: lockContent.implicitHeight + Style.spacing.sm * 2
-        radius: Style.cornerRadius
-        color: root.locked
-          ? Style.normalFillFor(root.bar ? root.bar.urgent : Color.urgent, Color.accent)
-          : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.04)
-        borderSpec: root.locked
-          ? Border.controlSpec("normal", root.bar ? root.bar.urgent : Color.urgent,
-              root.bar ? root.bar.urgent : Color.urgent)
-          : Border.none()
+        label: "Lock window positions"
+        description: root.locked
+          ? "On · column " + (root.dynamicZone > 0 ? root.dynamicZone : "?") + " accepts new windows"
+          : (root.lockSupported ? "Off · keep empty slots when windows close" : root.lockReason)
+        checked: root.locked
+        enabled: root.locked || root.lockSupported
+        opacity: enabled ? 1 : 0.5
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        accent: root.bar ? root.bar.urgent : Color.urgent
+        onClicked: root.act(["toggle-lock"])
+      }
 
-        Item {
-          id: lockContent
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.leftMargin: Style.spacing.sm
-          anchors.rightMargin: Style.spacing.sm
-          anchors.verticalCenter: parent.verticalCenter
-          implicitHeight: Math.max(lockText.implicitHeight, lockActions.implicitHeight)
-          height: implicitHeight
+      Item {
+        width: parent.width
+        height: root.locked ? lockActions.implicitHeight : 0
+        visible: root.locked
+        clip: true
 
-          Column {
-            id: lockText
-            anchors.left: parent.left
-            anchors.right: lockActions.left
-            anchors.rightMargin: Style.spacing.controlGap
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(1)
+        Row {
+          id: lockActions
+          anchors.horizontalCenter: parent.horizontalCenter
+          spacing: Style.spacing.controlGap
 
-            Text {
-              width: parent.width
-              text: root.locked ? "Layout locked" : "Stable layout slots"
-              color: root.locked
-                ? (root.bar ? root.bar.urgent : Color.urgent)
-                : (root.bar ? root.bar.foreground : Color.foreground)
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
-              font.pixelSize: Style.font.body
-              elide: Text.ElideRight
-            }
-
-            Text {
-              width: parent.width
-              text: root.locked
-                ? "Column " + (root.dynamicZone > 0 ? root.dynamicZone : "?") + " accepts new windows"
-                : (root.lockSupported ? "Keep empty slots when windows close" : root.lockReason)
-              color: Color.muted
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
-              font.pixelSize: Style.font.caption
-              elide: Text.ElideRight
-            }
+          Button {
+            text: "Recapture"
+            iconText: "󰑓"
+            bordered: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            onClicked: root.act(["recapture-lock"])
           }
 
-          Row {
-            id: lockActions
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.spacing.controlGap
-
-            PanelActionButton {
-              visible: !root.locked
-              enabled: root.lockSupported
-              iconText: "󰌾"
-              tooltipText: root.lockSupported ? "Lock current layout" : root.lockReason
-              foreground: root.bar ? root.bar.foreground : Color.foreground
-              bordered: true
-              onClicked: root.act(["lock"])
-            }
-
-            PanelActionButton {
-              visible: root.locked
-              iconText: "󰌿"
-              tooltipText: "Unlock"
-              foreground: root.bar ? root.bar.urgent : Color.urgent
-              bordered: true
-              onClicked: root.act(["unlock"])
-            }
-
-            PanelActionButton {
-              visible: root.locked
-              iconText: "󰑓"
-              tooltipText: "Recapture current slots"
-              foreground: root.bar ? root.bar.foreground : Color.foreground
-              bordered: true
-              onClicked: root.act(["recapture-lock"])
-            }
-
-            PanelActionButton {
-              visible: root.locked
-              iconText: "󰓫"
-              tooltipText: "Make focused column dynamic"
-              foreground: root.bar ? root.bar.foreground : Color.foreground
-              bordered: true
-              onClicked: root.act(["dynamic-focused"])
-            }
+          Button {
+            text: "Focused column is dynamic"
+            iconText: "󰓫"
+            bordered: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            onClicked: root.act(["dynamic-focused"])
           }
         }
       }
