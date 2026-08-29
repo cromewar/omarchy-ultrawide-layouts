@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -u
+
+if [[ "${1:-}" == "--batch" ]]; then
+  layout="${MOCK_LAYOUT:-master}"
+  printf '{"id":1,"monitor":"TEST","tiledLayout":"%s","windows":3,"hasfullscreen":false}\n' "$layout"
+  printf '[{"name":"TEST","width":1200,"height":800,"scale":1,"transform":0}]\n'
+  printf '[{"workspace":{"id":1},"floating":false,"mapped":true,"hidden":false,"fullscreen":0,"at":[0,0],"size":[300,800]},{"workspace":{"id":1},"floating":false,"mapped":true,"hidden":false,"fullscreen":0,"at":[300,0],"size":[600,800]},{"workspace":{"id":1},"floating":false,"mapped":true,"hidden":false,"fullscreen":0,"at":[900,0],"size":[300,800]}]\n'
+  printf '{"int":2}\n'
+  printf '{"str":"center"}\n'
+  exit 0
+fi
+
+case "${1:-}" in
+  configerrors)
+    if [[ -n "${MOCK_CONFIG_ERROR_FILE:-}" && -e "$MOCK_CONFIG_ERROR_FILE" ]]; then
+      printf 'mock configuration error\n'
+    fi
+    ;;
+  reload)
+    if [[ -n "${MOCK_RELOAD_MARKER:-}" ]]; then
+      : >"$MOCK_RELOAD_MARKER"
+    fi
+    exit "${MOCK_RELOAD_EXIT:-0}"
+    ;;
+  activeworkspace)
+    printf '{"id":1}\n'
+    ;;
+  eval)
+    exit 0
+    ;;
+  *)
+    printf '[]\n'
+    ;;
+esac

@@ -26,6 +26,22 @@ PRESET_DIR="$STATE_HOME/omarchy/layout-presets"
 # Shared with omarchy-hyprland-workspace-layout-toggle (SUPER + L) on purpose,
 # so both write the same file and neither silently loses to the other.
 RULE_DIR="$STATE_HOME/omarchy/workspace-layouts"
+LOCK_DIR="$STATE_HOME/omarchy/layout-locks"
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PLUGIN_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+LOCK_PROVIDER="$PLUGIN_ROOT/layouts/locked.lua"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+HYPR_CONFIG_DIR="$CONFIG_HOME/hypr"
+HYPRLAND_CONFIG="$HYPR_CONFIG_DIR/hyprland.lua"
+BINDINGS_CONFIG="$HYPR_CONFIG_DIR/bindings.lua"
+
+LOCK_LAYOUT="lua:cromewar-ultrawide-lock"
+LOCK_PROVIDER_BEGIN="-- BEGIN cromewar.ultrawide-layouts lock provider"
+LOCK_PROVIDER_END="-- END cromewar.ultrawide-layouts lock provider"
+LOCK_BINDING_BEGIN="-- BEGIN cromewar.ultrawide-layouts lock binding"
+LOCK_BINDING_END="-- END cromewar.ultrawide-layouts lock binding"
+DEFAULT_LOCK_KEY="SUPER + ALT + L"
 
 # key|label|icon|layout|orientation|mfact   (cycle order)
 PRESETS=(
@@ -53,7 +69,13 @@ COLUMN_TOLERANCE=8
 # else to confirm the press.
 NOTIFY=0
 
-die()  { printf 'hypr-layout-preset: %s\n' "$*" >&2; exit 1; }
+notify_error() {
+  [[ "$NOTIFY" == "1" ]] || return 0
+  command -v omarchy-notification-send >/dev/null || return 0
+  omarchy-notification-send -g "󰚌" "Layout lock" "$*" >/dev/null 2>&1 || true
+}
+
+die()  { notify_error "$*"; printf 'hypr-layout-preset: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'hypr-layout-preset: %s\n' "$*" >&2; }
 
 # Checked in main() rather than at load time, so tests can source this file for
@@ -319,6 +341,72 @@ write_state() {
   return 0
 }
 
+lock_meta_path() { printf '%s/%s.json\n' "$LOCK_DIR" "$1"; }
+lock_layout_path() { printf '%s/%s.lua\n' "$LOCK_DIR" "$1"; }
+
+lock_meta_current() {
+  local ws="$1" file session
+  file=$(lock_meta_path "$ws")
+  [[ -r "$file" ]] || return 1
+  session="${HYPRLAND_INSTANCE_SIGNATURE:-}"
+  [[ -n "$session" ]] || return 1
+  jq -e --arg session "$session" '.version == 1 and .session == $session' "$file" >/dev/null 2>&1
+}
+
+lock_base_field() {
+  local ws="$1" field_name="$2" file
+  file=$(lock_meta_path "$ws")
+  [[ -r "$file" ]] || return 1
+  jq -r --arg field "$field_name" '.[$field] // ""' "$file"
+}
+
+lock_dynamic_zone() {
+  local ws="$1" file value=""
+  file=$(lock_layout_path "$ws")
+  if [[ -r "$file" ]]; then
+    value=$(sed -n 's/^[[:space:]]*dynamic_zone[[:space:]]*=[[:space:]]*\([0-9][0-9]*\),.*/\1/p' "$file" | head -1)
+  fi
+  printf '%s\n' "$value"
+}
+
+lock_column_count() {
+  local ws="$1" file value=""
+  file=$(lock_layout_path "$ws")
+  if [[ -r "$file" ]]; then
+    value=$(sed -n 's/^[[:space:]]*column_count[[:space:]]*=[[:space:]]*\([0-9][0-9]*\),.*/\1/p' "$file" | head -1)
+  fi
+  printf '%s\n' "$value"
+}
+
+write_lock_meta() {
+  local ws="$1" key="$2" layout="$3" orientation="$4" mfact="$5" session="$6" tmp
+  mkdir -p "$LOCK_DIR" || die "cannot create $LOCK_DIR"
+  tmp=$(mktemp "$LOCK_DIR/.$ws.meta.XXXXXX") || die "mktemp failed in $LOCK_DIR"
+  if jq -nc \
+    --argjson version 1 --argjson workspace "$ws" \
+    --arg session "$session" --arg key "$key" --arg layout "$layout" \
+    --arg orientation "$orientation" --arg mfact "$mfact" \
+    '{version:$version, workspace:$workspace, session:$session,
+      baseKey:$key, baseLayout:$layout, baseOrientation:$orientation,
+      baseMfact:$mfact}' >"$tmp" && mv -f "$tmp" "$(lock_meta_path "$ws")"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  die "failed to write lock metadata for workspace $ws"
+}
+
+clear_lock_state() {
+  local ws="$1"
+  valid_ws "$ws" || return 1
+  rm -f "$(lock_meta_path "$ws")" "$(lock_layout_path "$ws")" "$LOCK_DIR/$ws.lua.tmp"
+}
+
+provider_installed() {
+  [[ -r "$LOCK_PROVIDER" && -r "$HYPRLAND_CONFIG" ]] || return 1
+  grep -Fq -- "$LOCK_PROVIDER_BEGIN" "$HYPRLAND_CONFIG" &&
+    grep -Fq -- "dofile(\"$(lua_escape "$LOCK_PROVIDER")\")" "$HYPRLAND_CONFIG"
+}
+
 # Rewritten in place via a temp file: this directory is sourced by Hyprland on
 # every config reload, and a half-written file is a syntax error that takes the
 # whole reload down with it. The temp name deliberately does not end in .lua, so
@@ -341,10 +429,26 @@ write_rule_file() {
 
 # Workspaces come and go; their state files should not outlive them.
 prune_state() {
-  local live f base
-  [[ -d "$PRESET_DIR" ]] || return 0
+  local live f base ws meta_session layout orientation
   live=$(hyprctl workspaces -j 2>/dev/null | jq -r '.[].id' | tr '\n' ' ')
   [[ -n "$live" ]] || return 0
+
+  # A compositor restart invalidates window identities even when the numeric
+  # workspace still exists. Replace its conditional lock rule with the saved
+  # base rule and discard the stale geometry.
+  for f in "$LOCK_DIR"/*.json; do
+    [[ -r "$f" ]] || continue
+    ws=$(jq -r '.workspace // 0' "$f")
+    valid_ws "$ws" || continue
+    meta_session=$(jq -r '.session // ""' "$f")
+    if [[ "$meta_session" != "${HYPRLAND_INSTANCE_SIGNATURE:-}" || " $live " != *" $ws "* ]]; then
+      layout=$(jq -r '.baseLayout // "dwindle"' "$f")
+      orientation=$(jq -r '.baseOrientation // ""' "$f")
+      write_rule_file "$ws" "$(build_rule_lua "$ws" "$layout" "$orientation")"
+      clear_lock_state "$ws"
+    fi
+  done
+
   for f in "$PRESET_DIR"/*.key "$PRESET_DIR"/*.mfact; do
     [[ -e "$f" ]] || continue
     base=$(basename "$f"); base="${base%.*}"
@@ -393,6 +497,14 @@ clamp_mfact() {
 
 # ---------------------------------------------------------------------- apply
 
+lua_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  printf '%s\n' "$value"
+}
+
 # The rule and the ratio go out as one Lua chunk in a single `hyprctl eval`.
 # Sent as two calls, the mfact layoutmsg can land while the workspace is still
 # on the old layout — dwindle ignores it — and the ratio is silently lost.
@@ -405,6 +517,21 @@ build_rule_lua() {
   else
     printf 'hl.workspace_rule({ workspace = "%s", layout = "%s" })' "$ws" "$layout"
   fi
+}
+
+build_locked_rule_lua() {
+  local ws="$1" session="$2" base_layout="$3" base_orientation="$4" active fallback
+  active=$(build_rule_lua "$ws" "$LOCK_LAYOUT" "")
+  fallback=$(build_rule_lua "$ws" "$base_layout" "$base_orientation")
+  printf 'if os.getenv("HYPRLAND_INSTANCE_SIGNATURE") == "%s" then %s else %s end\n' \
+    "$(lua_escape "$session")" "$active" "$fallback"
+}
+
+build_begin_lock_lua() {
+  local ws="$1" expected="$2" session="$3" rule
+  rule=$(build_rule_lua "$ws" "$LOCK_LAYOUT" "")
+  printf 'if not _G.cromewar_ultrawide_lock then error("layout lock provider is not loaded") end; if not _G.cromewar_ultrawide_lock.begin_capture(%s, %s, "%s") then error("layout capture refused") end; %s\n' \
+    "$ws" "$expected" "$(lua_escape "$session")" "$rule"
 }
 
 # The full chunk `set` executes: the rule, plus the ratio when there is
@@ -453,10 +580,125 @@ apply_mfact() {
     warn "could not apply mfact $1"
 }
 
+# --------------------------------------------------------------- layout lock
+
+lock_support_reason() {
+  local probe="$1" key="$2" ws tiled
+  ws=$(jq -r '.workspace // 0' <<<"$probe")
+  tiled=$(jq -r '.tiled // 0' <<<"$probe")
+  valid_ws "$ws" || { printf 'Layout lock is only available on ordinary workspaces\n'; return 1; }
+  provider_installed || {
+    printf 'Run %s setup to enable the Hyprland layout provider\n' "$SCRIPT_DIR/hypr-layout-preset"
+    return 1
+  }
+  [[ "$(jq -r '.hasfullscreen // false' <<<"$probe")" == "false" ]] || {
+    printf 'Exit fullscreen before locking this workspace\n'
+    return 1
+  }
+  ((tiled >= 2)) || {
+    printf 'Open at least two tiled windows before locking the layout\n'
+    return 1
+  }
+  [[ "$key" != "scrolling" ]] || {
+    printf 'The scrolling layout cannot be locked\n'
+    return 1
+  }
+  row_for "$key" >/dev/null || {
+    printf 'The current third-party layout cannot be locked\n'
+    return 1
+  }
+  return 0
+}
+
+lock_workspace() {
+  local probe="${1:-}" ws key reason layout orientation threshold mfact session tiled
+  local locked_rule begin_lua previous had_previous=0
+  [[ -n "$probe" ]] || probe=$(probe)
+  ws=$(jq -r '.workspace // 0' <<<"$probe")
+  valid_ws "$ws" || die "no ordinary focused workspace (got '$ws')"
+  lock_meta_current "$ws" && return 0
+
+  key=$(current_key "$probe" "$ws")
+  if ! reason=$(lock_support_reason "$probe" "$key"); then die "$reason"; fi
+  layout=$(jq -r '.layout // ""' <<<"$probe")
+  orientation=$(rule_orientation "$ws" "$(jq -r '.global_orientation' <<<"$probe")" "$layout")
+  threshold=$(jq -r '.center_threshold // 2' <<<"$probe")
+  mfact=$(printf '%s' "$probe" | measure_mfact "$orientation" "$threshold")
+  [[ -n "$mfact" ]] || mfact=$(stored_mfact "$ws")
+  session="${HYPRLAND_INSTANCE_SIGNATURE:-}"
+  [[ -n "$session" ]] || die "HYPRLAND_INSTANCE_SIGNATURE is unavailable"
+  tiled=$(jq -r '.tiled // 0' <<<"$probe")
+
+  mkdir -p "$RULE_DIR" "$LOCK_DIR" || die "cannot create layout state directories"
+  previous=$(mktemp "$RULE_DIR/.$ws.previous.XXXXXX") || die "cannot stage the previous workspace rule"
+  if [[ -r "$RULE_DIR/$ws.lua" ]]; then
+    cp "$RULE_DIR/$ws.lua" "$previous"
+    had_previous=1
+  fi
+
+  write_lock_meta "$ws" "$key" "$layout" "$orientation" "$mfact" "$session"
+  locked_rule=$(build_locked_rule_lua "$ws" "$session" "$layout" "$orientation")
+  write_rule_file "$ws" "$locked_rule"
+  begin_lua=$(build_begin_lock_lua "$ws" "$tiled" "$session")
+
+  if ! hyprctl eval "$begin_lua" >/dev/null 2>&1; then
+    if ((had_previous)); then cp "$previous" "$RULE_DIR/$ws.lua"; else rm -f "$RULE_DIR/$ws.lua"; fi
+    clear_lock_state "$ws"
+    hyprctl eval "$(build_rule_lua "$ws" "$layout" "$orientation")" >/dev/null 2>&1 || true
+    rm -f "$previous"
+    die "Hyprland rejected the layout lock; confirm setup completed without config errors"
+  fi
+  rm -f "$previous"
+  write_state "$ws" "$key" "$mfact"
+}
+
+unlock_workspace() {
+  local probe="${1:-}" ws key layout orientation mfact tiled
+  [[ -n "$probe" ]] || probe=$(probe)
+  ws=$(jq -r '.workspace // 0' <<<"$probe")
+  valid_ws "$ws" || die "no ordinary focused workspace (got '$ws')"
+  [[ -r "$(lock_meta_path "$ws")" ]] || return 0
+
+  key=$(lock_base_field "$ws" baseKey)
+  layout=$(lock_base_field "$ws" baseLayout)
+  orientation=$(lock_base_field "$ws" baseOrientation)
+  mfact=$(lock_base_field "$ws" baseMfact)
+  tiled=$(jq -r '.tiled // 0' <<<"$probe")
+  [[ -n "$layout" ]] || die "lock metadata for workspace $ws has no base layout"
+
+  apply_preset "$ws" "$layout" "$orientation" "$mfact" "$tiled"
+  clear_lock_state "$ws"
+  write_state "$ws" "$key" "$mfact"
+}
+
+lock_layout_message() {
+  local message="$1" label="$2" probe ws
+  probe=$(probe)
+  ws=$(jq -r '.workspace // 0' <<<"$probe")
+  lock_meta_current "$ws" || die "the focused workspace is not layout-locked"
+  hyprctl dispatch layoutmsg "$message" >/dev/null 2>&1 || die "Hyprland could not $label"
+}
+
+notify_lock_state() {
+  [[ "$NOTIFY" == "1" ]] || return 0
+  command -v omarchy-notification-send >/dev/null || return 0
+  local st title detail
+  st=$(cmd_status)
+  [[ "$st" == "{}" ]] && return 0
+  if [[ "$(jq -r '.locked' <<<"$st")" == "true" ]]; then
+    title="Layout locked"
+    detail="$(jq -r '.label' <<<"$st") · dynamic column $(jq -r '.dynamicZone // "?"' <<<"$st")"
+  else
+    title="Layout unlocked"
+    detail="$(jq -r '.label' <<<"$st")"
+  fi
+  omarchy-notification-send -g "󰌾" "$title" "$detail"
+}
+
 # -------------------------------------------------------------------- commands
 
 set_preset() {
-  local key="$1" probe="${2:-}" row ws layout orientation mfact tiled
+  local key="$1" probe="${2:-}" row ws layout orientation mfact tiled was_locked=0
   row=$(row_for "$key") || die "unknown preset: $key (try: $(keys | paste -sd' '))"
   [[ -n "$probe" ]] || probe=$(probe)
   ws=$(jq -r '.workspace' <<<"$probe")
@@ -469,7 +711,9 @@ set_preset() {
   orientation=$(field "$row" 5)
   mfact=$(field "$row" 6)
 
+  lock_meta_current "$ws" && was_locked=1
   apply_preset "$ws" "$layout" "$orientation" "$mfact" "$tiled"
+  ((was_locked)) && clear_lock_state "$ws"
   write_state "$ws" "$key" "$mfact"
 }
 
@@ -478,6 +722,7 @@ nudge_mfact() {
   probe=$(probe)
   ws=$(jq -r '.workspace' <<<"$probe")
   valid_ws "$ws" || return 1
+  lock_meta_current "$ws" && die "unlock the workspace before resizing its master column"
   layout=$(jq -r '.layout // ""' <<<"$probe")
   [[ "$layout" == "master" ]] || return 1
 
@@ -521,6 +766,10 @@ step_preset() {
 # from the workspace's own state.
 current_key() {
   local probe="$1" ws="$2" threshold orientation layout
+  if lock_meta_current "$ws"; then
+    lock_base_field "$ws" baseKey
+    return
+  fi
   threshold=$(jq -r '.center_threshold' <<<"$probe")
   layout=$(jq -r '.layout // ""' <<<"$probe")
   orientation=$(rule_orientation "$ws" "$(jq -r '.global_orientation' <<<"$probe")" "$layout")
@@ -530,6 +779,7 @@ current_key() {
 
 cmd_status() {
   local probe ws width cols threshold orientation layout key row mfact measured snapped nominal
+  local locked=false lock_supported=false lock_reason="" dynamic_zone="" lock_columns="" setup_present=false
   probe=$(probe)
   ws=$(jq -r '.workspace' <<<"$probe")
   if [[ ! "$ws" =~ ^-?[0-9]+$ ]]; then
@@ -541,22 +791,45 @@ cmd_status() {
   cols=$(jq -r '.columns | length' <<<"$probe")
   threshold=$(jq -r '.center_threshold' <<<"$probe")
   layout=$(jq -r '.layout // ""' <<<"$probe")
-  orientation=$(rule_orientation "$ws" "$(jq -r '.global_orientation' <<<"$probe")" "$layout")
+  if provider_installed; then setup_present=true; fi
 
-  key=$(current_key "$probe" "$ws")
+  if lock_meta_current "$ws"; then
+    locked=true
+    lock_supported=true
+    key=$(lock_base_field "$ws" baseKey)
+    layout=$(lock_base_field "$ws" baseLayout)
+    orientation=$(lock_base_field "$ws" baseOrientation)
+    mfact=$(lock_base_field "$ws" baseMfact)
+    dynamic_zone=$(lock_dynamic_zone "$ws")
+    lock_columns=$(lock_column_count "$ws")
+    [[ "$lock_columns" =~ ^[0-9]+$ ]] && cols="$lock_columns"
+  else
+    orientation=$(rule_orientation "$ws" "$(jq -r '.global_orientation' <<<"$probe")" "$layout")
+    key=$(current_key "$probe" "$ws")
+    if lock_reason=$(lock_support_reason "$probe" "$key"); then
+      lock_supported=true
+      lock_reason=""
+    fi
+  fi
   row=$(row_for "$key") || row="$key|$key||$key||"
 
-  measured=$(printf '%s' "$probe" | measure_mfact "$orientation" "$threshold")
   nominal=$(field "$row" 6)
   snapped=false
 
-  if [[ -z "$measured" ]]; then
+  if [[ "$locked" == "true" ]]; then
+    [[ -n "$mfact" ]] || mfact="${nominal:-0.5}"
+    snapped=true
+  else
+    measured=$(printf '%s' "$probe" | measure_mfact "$orientation" "$threshold")
+  fi
+
+  if [[ "$locked" != "true" && -z "$measured" ]]; then
     # Nothing measurable — an empty workspace, a lone window, everything
     # fullscreen, or a centre master below its slave threshold. Report the
     # preset's own ratio and do not claim it has been dragged off it.
     mfact="${nominal:-$(stored_mfact "$ws")}"
     [[ -n "$nominal" ]] && snapped=true
-  else
+  elif [[ "$locked" != "true" ]]; then
     mfact="$measured"
     # Now that the span cancels the gaps, an untouched preset measures its
     # nominal ratio essentially exactly, so this only absorbs integer rounding
@@ -570,6 +843,11 @@ cmd_status() {
 
   jq -nc \
     --argjson snapped "$snapped" \
+    --argjson locked "$locked" \
+    --argjson lock_supported "$lock_supported" \
+    --argjson setup_present "$setup_present" \
+    --arg lock_reason "$lock_reason" \
+    --arg dynamic_zone "$dynamic_zone" \
     --arg key "$key" \
     --arg label "$(field "$row" 2)" \
     --arg icon "$(field "$row" 3)" \
@@ -583,7 +861,10 @@ cmd_status() {
     --argjson mfact "$mfact" \
     '{workspace:$ws, monitor:$monitor, width:$width, key:$key, label:$label,
       icon:$icon, layout:$layout, orientation:$orientation, mfact:$mfact,
-      columns:$columns, geometry:$geometry, snapped:$snapped}'
+      columns:$columns, geometry:$geometry, snapped:$snapped,
+      locked:$locked, lockSupported:$lock_supported, lockReason:$lock_reason,
+      setupPresent:$setup_present,
+      dynamicZone:(if $dynamic_zone == "" then null else ($dynamic_zone | tonumber) end)}'
 }
 
 # Every preset with the geometry it would produce on the focused monitor, so a
@@ -617,6 +898,231 @@ notify_current() {
     "$(jq -r '.label' <<<"$st")" "$(jq -r '.geometry' <<<"$st")"
 }
 
+# --------------------------------------------------------------- setup/teardown
+
+normalize_hotkey() {
+  printf '%s\n' "$1" | awk '
+    {
+      gsub(/\+/, " ")
+      for (i = 1; i <= NF; i++) {
+        token = toupper($i)
+        if (token == "SUPER" || token == "MOD4") super = 1
+        else if (token == "CTRL" || token == "CONTROL") ctrl = 1
+        else if (token == "ALT") alt = 1
+        else if (token == "SHIFT") shift = 1
+        else key = key token
+      }
+    }
+    END {
+      printf "%s%s%s%s%s\n", super ? "SUPER" : "", ctrl ? "CTRL" : "",
+        alt ? "ALT" : "", shift ? "SHIFT" : "", key
+    }
+  '
+}
+
+key_conflicts() {
+  local wanted line binding description listing
+  wanted=$(normalize_hotkey "$1")
+  command -v omarchy >/dev/null || return 2
+  listing=$(omarchy menu keybindings --print 2>/dev/null) || return 2
+  while IFS= read -r line; do
+    [[ "$line" == *"→"* ]] || continue
+    binding=${line%%→*}
+    description=${line#*→}
+    [[ "$description" == *"Toggle layout lock"* ]] && continue
+    [[ "$(normalize_hotkey "$binding")" == "$wanted" ]] && {
+      printf '%s\n' "$line"
+      return 0
+    }
+  done <<<"$listing"
+  return 1
+}
+
+strip_marked_block() {
+  local input="$1" output="$2" begin="$3" end="$4"
+  awk -v begin="$begin" -v end="$end" '
+    $0 == begin {
+      if (inside || seen_begin) exit 20
+      inside = 1; seen_begin = 1; next
+    }
+    $0 == end {
+      if (!inside || seen_end) exit 21
+      inside = 0; seen_end = 1; next
+    }
+    !inside { print }
+    END {
+      if (inside || seen_begin != seen_end) exit 22
+    }
+  ' "$input" >"$output"
+}
+
+insert_provider_block() {
+  local input="$1" output="$2" provider_line found
+  provider_line="dofile(\"$(lua_escape "$LOCK_PROVIDER")\")"
+  awk -v begin="$LOCK_PROVIDER_BEGIN" -v finish="$LOCK_PROVIDER_END" \
+      -v provider="$provider_line" '
+    $0 == "require(\"default.hypr.toggles\")" && !inserted {
+      print begin
+      print provider
+      print finish
+      print ""
+      inserted = 1
+    }
+    { print }
+    END { if (!inserted) exit 23 }
+  ' "$input" >"$output"
+}
+
+append_binding_block() {
+  local input="$1" output="$2" key="$3"
+  cp "$input" "$output" || return 1
+  {
+    printf '\n%s\n' "$LOCK_BINDING_BEGIN"
+    printf 'local ultrawide_layouts = "%s"\n' "$(lua_escape "$SCRIPT_DIR/hypr-layout-preset")"
+    printf 'o.bind("%s", "Toggle layout lock", ultrawide_layouts .. " --notify toggle-lock")\n' \
+      "$(lua_escape "$key")"
+    printf '%s\n' "$LOCK_BINDING_END"
+  } >>"$output"
+}
+
+cleanup_stage_dir() {
+  local stage="$1"
+  rm -f "$stage/hyprland.original" "$stage/bindings.original" \
+    "$stage/hyprland.clean" "$stage/bindings.clean" \
+    "$stage/hyprland.next" "$stage/bindings.next"
+  rmdir "$stage" 2>/dev/null || true
+}
+
+rollback_configs() {
+  local stage="$1" failed=0
+  cp "$stage/hyprland.original" "$HYPRLAND_CONFIG" || failed=1
+  cp "$stage/bindings.original" "$BINDINGS_CONFIG" || failed=1
+  hyprctl reload >/dev/null 2>&1 || true
+  return "$failed"
+}
+
+edit_hypr_configs() {
+  local mode="$1" key="${2:-}" stage errors conflict
+  [[ -r "$HYPRLAND_CONFIG" ]] || die "missing $HYPRLAND_CONFIG"
+  [[ -r "$BINDINGS_CONFIG" ]] || die "missing $BINDINGS_CONFIG"
+
+  errors=$(hyprctl configerrors 2>/dev/null || true)
+  [[ -z "$errors" ]] || die "Hyprland already has config errors; fix them before $mode"
+
+  if [[ "$mode" == "setup" ]]; then
+    if conflict=$(key_conflicts "$key"); then
+      die "$key is already bound: $conflict (choose another with setup --key \"...\")"
+    elif [[ $? -eq 2 ]]; then
+      die "cannot inspect Omarchy keybindings before setup"
+    fi
+  fi
+
+  stage=$(mktemp -d "$HYPR_CONFIG_DIR/.ultrawide-layouts.XXXXXX") || die "cannot stage Hyprland config"
+  cp "$HYPRLAND_CONFIG" "$stage/hyprland.original" || { cleanup_stage_dir "$stage"; die "cannot back up hyprland.lua"; }
+  cp "$BINDINGS_CONFIG" "$stage/bindings.original" || { cleanup_stage_dir "$stage"; die "cannot back up bindings.lua"; }
+
+  if ! strip_marked_block "$stage/hyprland.original" "$stage/hyprland.clean" \
+      "$LOCK_PROVIDER_BEGIN" "$LOCK_PROVIDER_END" ||
+    ! strip_marked_block "$stage/bindings.original" "$stage/bindings.clean" \
+      "$LOCK_BINDING_BEGIN" "$LOCK_BINDING_END"; then
+    cleanup_stage_dir "$stage"
+    die "the plugin's config markers are incomplete or duplicated; no files were changed"
+  fi
+
+  if [[ "$mode" == "setup" ]]; then
+    if ! insert_provider_block "$stage/hyprland.clean" "$stage/hyprland.next" ||
+      ! append_binding_block "$stage/bindings.clean" "$stage/bindings.next" "$key"; then
+      cleanup_stage_dir "$stage"
+      die "could not construct the Hyprland config update"
+    fi
+  else
+    cp "$stage/hyprland.clean" "$stage/hyprland.next"
+    cp "$stage/bindings.clean" "$stage/bindings.next"
+  fi
+
+  chmod --reference="$HYPRLAND_CONFIG" "$stage/hyprland.next" 2>/dev/null || true
+  chmod --reference="$BINDINGS_CONFIG" "$stage/bindings.next" 2>/dev/null || true
+  if [[ ! -e "$HYPRLAND_CONFIG.ultrawide-layouts.bak" ]] &&
+    ! cp "$HYPRLAND_CONFIG" "$HYPRLAND_CONFIG.ultrawide-layouts.bak"; then
+    cleanup_stage_dir "$stage"
+    die "cannot create the hyprland.lua backup"
+  fi
+  if [[ ! -e "$BINDINGS_CONFIG.ultrawide-layouts.bak" ]] &&
+    ! cp "$BINDINGS_CONFIG" "$BINDINGS_CONFIG.ultrawide-layouts.bak"; then
+    cleanup_stage_dir "$stage"
+    die "cannot create the bindings.lua backup"
+  fi
+
+  if ! mv -f "$stage/hyprland.next" "$HYPRLAND_CONFIG" ||
+    ! mv -f "$stage/bindings.next" "$BINDINGS_CONFIG" ||
+    ! hyprctl reload >/dev/null 2>&1; then
+    if ! rollback_configs "$stage"; then
+      die "Hyprland reload failed and automatic rollback failed; originals remain in $stage"
+    fi
+    cleanup_stage_dir "$stage"
+    die "Hyprland reload failed; the original config was restored"
+  fi
+
+  errors=$(hyprctl configerrors 2>/dev/null || true)
+  if [[ -n "$errors" ]]; then
+    if ! rollback_configs "$stage"; then
+      die "Hyprland reported a config error and rollback failed; originals remain in $stage"
+    fi
+    cleanup_stage_dir "$stage"
+    die "Hyprland reported a config error; the original config was restored: $errors"
+  fi
+  cleanup_stage_dir "$stage"
+}
+
+restore_all_locks() {
+  local file ws key layout orientation mfact rule active_ws tiled=0
+  active_ws=$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // 0')
+  [[ -d "$LOCK_DIR" ]] || return 0
+  for file in "$LOCK_DIR"/*.json; do
+    [[ -r "$file" ]] || continue
+    ws=$(jq -r '.workspace // 0' "$file")
+    valid_ws "$ws" || continue
+    key=$(jq -r '.baseKey // ""' "$file")
+    layout=$(jq -r '.baseLayout // "dwindle"' "$file")
+    orientation=$(jq -r '.baseOrientation // ""' "$file")
+    mfact=$(jq -r '.baseMfact // ""' "$file")
+    rule=$(build_rule_lua "$ws" "$layout" "$orientation")
+    write_rule_file "$ws" "$rule"
+    if [[ "$ws" == "$active_ws" ]]; then
+      tiled=$(probe | jq -r '.tiled // 0')
+      hyprctl eval "$(build_apply_lua "$ws" "$layout" "$orientation" "$mfact" "$tiled")" >/dev/null 2>&1 || true
+    else
+      hyprctl eval "$rule" >/dev/null 2>&1 || true
+    fi
+    clear_lock_state "$ws"
+    write_state "$ws" "$key" "$mfact"
+  done
+}
+
+cmd_setup() {
+  local key="$DEFAULT_LOCK_KEY"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --key)
+        [[ $# -ge 2 && -n "$2" ]] || die "setup --key needs a key chord"
+        key="$2"
+        shift 2
+        ;;
+      *) die "unknown setup option: $1" ;;
+    esac
+  done
+  [[ -r "$LOCK_PROVIDER" ]] || die "missing layout provider: $LOCK_PROVIDER"
+  edit_hypr_configs setup "$key"
+  printf 'Layout lock enabled on %s.\n' "$key"
+}
+
+cmd_teardown() {
+  restore_all_locks
+  edit_hypr_configs teardown
+  printf 'Layout lock disabled; saved workspace layouts were restored.\n'
+}
+
 usage() {
   cat <<USAGE
 hypr-layout-preset — ultrawide layout presets for the focused workspace
@@ -629,12 +1135,20 @@ hypr-layout-preset — ultrawide layout presets for the focused workspace
   snap            re-apply the current preset (undo a manual resize)
   wider [step]    grow the master   (default step 0.025)
   narrower [step] shrink the master
+  lock            capture and hold the current tiled window slots
+  unlock          return the workspace to its underlying preset
+  toggle-lock     lock or unlock the focused workspace
+  recapture-lock  replace the saved slots with the current arrangement
+  dynamic-focused make the focused window's column the dynamic column
+  setup [--key "SUPER + ALT + L"]
+                  install the provider and lock keybinding transactionally
+  teardown        unlock all workspaces and remove the installed config blocks
   prune           drop state for workspaces that no longer exist
 
 Presets: $(keys | paste -sd' ')
 
-Pass --notify before the subcommand to raise a desktop notification
-naming the preset it landed on. Used by the SUPER + L keybinding.
+Pass --notify before a subcommand to raise a desktop notification.
+The setup command uses it for the layout-lock keybinding.
 USAGE
 }
 
@@ -666,11 +1180,24 @@ main() {
     snap)
       probe=$(probe)
       ws=$(jq -r '.workspace' <<<"$probe")
+      lock_meta_current "$ws" && die "unlock the workspace before snapping its preset ratio"
       set_preset "$(current_key "$probe" "$ws")" "$probe"
       notify_current
       ;;
     wider) nudge_mfact "${2:-0.025}" ;;
     narrower) nudge_mfact "-${2:-0.025}" ;;
+    lock) lock_workspace; notify_lock_state ;;
+    unlock) unlock_workspace; notify_lock_state ;;
+    toggle-lock)
+      probe=$(probe)
+      ws=$(jq -r '.workspace // 0' <<<"$probe")
+      if lock_meta_current "$ws"; then unlock_workspace "$probe"; else lock_workspace "$probe"; fi
+      notify_lock_state
+      ;;
+    recapture-lock) lock_layout_message recapture "recapture the layout lock"; notify_lock_state ;;
+    dynamic-focused) lock_layout_message dynamic-focused "change the dynamic column"; notify_lock_state ;;
+    setup) cmd_setup "$@" ;;
+    teardown) cmd_teardown ;;
     prune) prune_state ;;
     -h | --help | help) usage ;;
     *)

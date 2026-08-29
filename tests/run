@@ -175,9 +175,18 @@ for k in $(keys); do
   check "icon  $k" "yes" "$([[ -n $(field "$r" 3) ]] && echo yes || echo MISSING)"
 done
 
+if command -v lua >/dev/null; then
+  if ! lua "$here/locked-layout.lua"; then fail=$((fail + 1)); fi
+else
+  printf '  \033[31mFAIL\033[0m  Lua is required to test the Hyprland layout provider\n'
+  fail=$((fail + 1))
+fi
+
+if ! "$here/setup-lifecycle"; then fail=$((fail + 1)); fi
+
 echo
 if ((fail == 0)); then
-  printf '\033[32m%d passed\033[0m\n\n' "$pass"
+  printf '\033[32m%d shell checks passed; Lua and setup suites passed\033[0m\n\n' "$pass"
 else
   printf '\033[31m%d passed, %d failed\033[0m\n\n' "$pass" "$fail"
 fi

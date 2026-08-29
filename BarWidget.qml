@@ -29,6 +29,11 @@ BarWidget {
   readonly property int workspaceId: state.workspace || 0
   readonly property int monitorWidth: state.width || 0
   readonly property bool isMaster: state.layout === "master"
+  readonly property bool locked: state.locked === true
+  readonly property bool lockSupported: state.lockSupported === true
+  readonly property bool setupPresent: state.setupPresent === true
+  readonly property string lockReason: state.lockReason || ""
+  readonly property int dynamicZone: state.dynamicZone || 0
   // False once a manual resize has pulled the master off the preset's own
   // ratio. Worth showing, because that is the state the snap action undoes.
   readonly property bool snapped: state.snapped === true
@@ -230,9 +235,9 @@ BarWidget {
     id: face
     anchors.fill: parent
     bar: root.bar
-    text: root.showLabel && !root.vertical && root.presetLabel !== ""
+    text: (root.showLabel && !root.vertical && root.presetLabel !== ""
       ? root.presetIcon + "  " + root.presetLabel
-      : root.presetIcon
+      : root.presetIcon) + (root.locked ? "  󰌾" : "")
     fontSize: root.showLabel && !root.vertical ? Style.font.body : Style.font.icon
     horizontalMargin: 7
     active: root.popupOpen
@@ -240,16 +245,18 @@ BarWidget {
     tooltipText: root.popupOpen ? "" : (
       root.presetLabel
         + (root.geometry !== "" ? "   " + root.geometry : "")
-        + (root.snapped ? "" : "   (resized)"))
+        + (root.locked ? "   Locked" : (root.snapped ? "" : "   (resized)")))
 
     onPressed: function(button) {
       if (button === Qt.RightButton) root.act(["next"])
-      else if (button === Qt.MiddleButton) root.act(["snap"])
+      else if (button === Qt.MiddleButton) {
+        if (!root.locked) root.act(["snap"])
+      }
       else root.popupOpen = !root.popupOpen
     }
 
     onWheelMoved: function(delta) {
-      if (!root.isMaster) return
+      if (!root.isMaster || root.locked) return
       root.scrollBy(delta > 0 ? 1 : -1)
     }
   }
@@ -278,6 +285,106 @@ BarWidget {
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.caption
         elide: Text.ElideRight
+      }
+
+      BorderSurface {
+        id: lockCard
+        width: parent.width
+        implicitHeight: lockContent.implicitHeight + Style.spacing.sm * 2
+        radius: Style.cornerRadius
+        color: root.locked
+          ? Style.normalFillFor(root.bar ? root.bar.urgent : Color.urgent, Color.accent)
+          : Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.04)
+        borderSpec: root.locked
+          ? Border.controlSpec("normal", root.bar ? root.bar.urgent : Color.urgent,
+              root.bar ? root.bar.urgent : Color.urgent)
+          : Border.none()
+
+        Item {
+          id: lockContent
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.leftMargin: Style.spacing.sm
+          anchors.rightMargin: Style.spacing.sm
+          anchors.verticalCenter: parent.verticalCenter
+          implicitHeight: Math.max(lockText.implicitHeight, lockActions.implicitHeight)
+          height: implicitHeight
+
+          Column {
+            id: lockText
+            anchors.left: parent.left
+            anchors.right: lockActions.left
+            anchors.rightMargin: Style.spacing.controlGap
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(1)
+
+            Text {
+              width: parent.width
+              text: root.locked ? "Layout locked" : "Stable layout slots"
+              color: root.locked
+                ? (root.bar ? root.bar.urgent : Color.urgent)
+                : (root.bar ? root.bar.foreground : Color.foreground)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.body
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: parent.width
+              text: root.locked
+                ? "Column " + (root.dynamicZone > 0 ? root.dynamicZone : "?") + " accepts new windows"
+                : (root.lockSupported ? "Keep empty slots when windows close" : root.lockReason)
+              color: Color.muted
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+          }
+
+          Row {
+            id: lockActions
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.spacing.controlGap
+
+            PanelActionButton {
+              visible: !root.locked
+              enabled: root.lockSupported
+              iconText: "󰌾"
+              tooltipText: root.lockSupported ? "Lock current layout" : root.lockReason
+              foreground: root.bar ? root.bar.foreground : Color.foreground
+              bordered: true
+              onClicked: root.act(["lock"])
+            }
+
+            PanelActionButton {
+              visible: root.locked
+              iconText: "󰌿"
+              tooltipText: "Unlock"
+              foreground: root.bar ? root.bar.urgent : Color.urgent
+              bordered: true
+              onClicked: root.act(["unlock"])
+            }
+
+            PanelActionButton {
+              visible: root.locked
+              iconText: "󰑓"
+              tooltipText: "Recapture current slots"
+              foreground: root.bar ? root.bar.foreground : Color.foreground
+              bordered: true
+              onClicked: root.act(["recapture-lock"])
+            }
+
+            PanelActionButton {
+              visible: root.locked
+              iconText: "󰓫"
+              tooltipText: "Make focused column dynamic"
+              foreground: root.bar ? root.bar.foreground : Color.foreground
+              bordered: true
+              onClicked: root.act(["dynamic-focused"])
+            }
+          }
+        }
       }
 
       Repeater {
@@ -380,8 +487,8 @@ BarWidget {
       // stays out of the way under dwindle and scrolling.
       Item {
         width: parent.width
-        height: root.isMaster ? stepper.implicitHeight + Style.spacing.sm : 0
-        visible: root.isMaster
+        height: root.isMaster && !root.locked ? stepper.implicitHeight + Style.spacing.sm : 0
+        visible: root.isMaster && !root.locked
         clip: true
 
         Row {

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -u
+
+if [[ "${1:-}" == "menu" && "${2:-}" == "keybindings" && "${3:-}" == "--print" ]]; then
+  printf '%b' "${MOCK_KEYBINDINGS:-SUPER + SPACE → Omarchy menu\\n}"
+  exit 0
+fi
+exit 1
