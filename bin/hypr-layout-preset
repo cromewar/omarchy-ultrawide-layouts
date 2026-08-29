@@ -714,6 +714,32 @@ lock_layout_message() {
   hyprctl dispatch layoutmsg "$message" >/dev/null 2>&1 || die "Hyprland could not $label"
 }
 
+directional_action() {
+  local requested="$1" direction label active ws
+  case "$requested" in
+    l | left)  direction=l; label=left ;;
+    r | right) direction=r; label=right ;;
+    u | up)    direction=u; label=up ;;
+    d | down)  direction=d; label=down ;;
+    *) die "directional needs left, right, up, or down" ;;
+  esac
+
+  active=$(hyprctl activewindow -j 2>/dev/null) || die "cannot inspect the focused window"
+  ws=$(jq -r '.workspace.id // 0' <<<"$active")
+
+  if lock_meta_current "$ws"; then
+    # The provider tries an adjacent vacancy and synchronously falls back to
+    # Hyprland's native swap when there is nothing rectangular to consume.
+    hyprctl eval \
+      "_G.cromewar_ultrawide_lock.directional_action(\"$direction\")" \
+      >/dev/null 2>&1 || die "Hyprland could not move the focused window $label"
+    return 0
+  fi
+
+  hyprctl eval "hl.dispatch(hl.dsp.window.swap({ direction = \"$direction\" }))" \
+    >/dev/null 2>&1 || die "Hyprland could not move the focused window $label"
+}
+
 notify_lock_state() {
   [[ "$NOTIFY" == "1" ]] || return 0
   command -v omarchy-notification-send >/dev/null || return 0
@@ -1016,6 +1042,18 @@ append_binding_block() {
     printf 'local ultrawide_layouts = "%s"\n' "$(lua_escape "$SCRIPT_DIR/hypr-layout-preset")"
     printf 'o.bind("%s", "Toggle layout lock", ultrawide_layouts .. " --notify toggle-lock")\n' \
       "$(lua_escape "$key")"
+    printf '%s\n' \
+      'for _, directional in ipairs({' \
+      '  { "LEFT", "l", "left" },' \
+      '  { "RIGHT", "r", "right" },' \
+      '  { "UP", "u", "up" },' \
+      '  { "DOWN", "d", "down" },' \
+      '}) do' \
+      '  local chord = "SUPER + SHIFT + " .. directional[1]' \
+      '  hl.unbind(chord)' \
+      '  o.bind(chord, "Swap or expand window " .. directional[3],' \
+      '    ultrawide_layouts .. " directional " .. directional[2])' \
+      'end'
     printf '%s\n' "$LOCK_BINDING_END"
   } >>"$output"
 }
@@ -1175,6 +1213,8 @@ hypr-layout-preset — ultrawide layout presets for the focused workspace
   toggle-lock     lock or unlock the focused workspace
   recapture-lock  replace the saved slots with the current arrangement
   dynamic-focused make the focused window's column the dynamic column
+  directional <left|right|up|down>
+                  swap normally, or expand into an adjacent locked vacancy
   setup [--key "SUPER + ALT + L"]
                   install the provider and lock keybinding transactionally
   teardown        unlock all workspaces and remove the installed config blocks
@@ -1231,6 +1271,10 @@ main() {
       ;;
     recapture-lock) lock_layout_message recapture "recapture the layout lock"; notify_lock_state ;;
     dynamic-focused) lock_layout_message dynamic-focused "change the dynamic column"; notify_lock_state ;;
+    directional)
+      [[ $# -ge 2 ]] || die "directional needs left, right, up, or down"
+      directional_action "$2"
+      ;;
     setup) cmd_setup "$@" ;;
     teardown) cmd_teardown ;;
     prune) prune_state ;;

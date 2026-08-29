@@ -158,6 +158,67 @@ layout.recalculate(context(area, { left_replacement, center_replacement, vacancy
 equal("new window fills left vacancy", 0, left_replacement.box.x)
 equal("right stays put through vacancy reuse", 900, vacancy_right.box.x)
 
+io.write("\nLayout lock — intentional vacancy expansion\n")
+layout._reset()
+local expand_top = target("0x81", 15, box(0, 0, 300, 400), true)
+local expand_bottom = target("0x82", 15, box(0, 400, 300, 400))
+local expand_center = target("0x83", 15, box(300, 0, 600, 800))
+local expand_right = target("0x84", 15, box(900, 0, 300, 800))
+local expand_state = capture(15,
+  { expand_top, expand_bottom, expand_center, expand_right }, area)
+layout.recalculate(context(area, { expand_top, expand_center, expand_right }))
+equal("closed lower-left slot becomes vacant", 1, #expand_state.vacancies)
+local expand_context = context(area, { expand_top, expand_center, expand_right })
+local conditional_swaps = 0
+real_hl = hl
+hl = {
+  dsp = {
+    layout = function(message) return { kind = "layout", message = message } end,
+    window = {
+      swap = function(options) return { kind = "swap", direction = options.direction } end,
+    },
+  },
+  dispatch = function(action)
+    if action.kind == "layout" then
+      layout.layout_msg(expand_context, action.message)
+    elseif action.kind == "swap" then
+      conditional_swaps = conditional_swaps + 1
+    end
+  end,
+}
+equal("conditional up action succeeds", true, layout.directional_action("u"))
+equal("wrong direction falls back to native swap", 1, conditional_swaps)
+equal("wrong direction keeps upper-left height", 400, expand_top.box.h)
+equal("conditional down action succeeds", true, layout.directional_action("d"))
+equal("down expansion skips native swap", 1, conditional_swaps)
+equal("expanded window fills full column height", 800, expand_top.box.h)
+equal("expanded window keeps left x", 0, expand_top.box.x)
+equal("expansion consumes the vacancy", 0, #expand_state.vacancies)
+equal("expansion does not move center", 300, expand_center.box.x)
+equal("expansion does not move right", 900, expand_right.box.x)
+hl = real_hl
+
+io.write("\nLayout lock — repeated vacancy expansion\n")
+layout._reset()
+local repeat_top = target("0x91", 16, box(0, 0, 300, 200), true)
+local repeat_middle = target("0x92", 16, box(0, 200, 300, 200))
+local repeat_bottom = target("0x93", 16, box(0, 400, 300, 400))
+local repeat_center = target("0x94", 16, box(300, 0, 600, 800))
+local repeat_right = target("0x95", 16, box(900, 0, 300, 800))
+local repeat_state = capture(16,
+  { repeat_top, repeat_middle, repeat_bottom, repeat_center, repeat_right }, area)
+layout.recalculate(context(area, { repeat_top, repeat_center, repeat_right }))
+equal("two closed stacked slots become vacant", 2, #repeat_state.vacancies)
+equal("first down press consumes adjacent middle", true,
+  layout.layout_msg(context(area, { repeat_top, repeat_center, repeat_right }),
+    "fill-vacancy d"))
+equal("first down press grows through middle", 400, repeat_top.box.h)
+equal("second down press consumes adjacent bottom", true,
+  layout.layout_msg(context(area, { repeat_top, repeat_center, repeat_right }),
+    "fill-vacancy d"))
+equal("second down press fills column", 800, repeat_top.box.h)
+equal("both stacked vacancies are consumed", 0, #repeat_state.vacancies)
+
 io.write("\nLayout lock — config reload handoff is not a close\n")
 layout._reset()
 local reload_left = target("0x51", 12, box(0, 0, 300, 800))

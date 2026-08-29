@@ -324,6 +324,17 @@ local function union_boxes(ids, boxes)
   return { x = x1, y = y1, w = x2 - x1, h = y2 - y1 }
 end
 
+local function merged_box(a, b)
+  local x = math.min(a.x, b.x)
+  local y = math.min(a.y, b.y)
+  return {
+    x = x,
+    y = y,
+    w = math.max(a.x + a.w, b.x + b.w) - x,
+    h = math.max(a.y + a.h, b.y + b.h) - y,
+  }
+end
+
 local function finalize_capture(state, area, targets)
   local tolerance = COLUMN_TOLERANCE / math.max(area.w, 1)
   local columns = {}
@@ -645,15 +656,68 @@ local function recapture(ctx)
   return true
 end
 
+local function focused_target(ctx)
+  for _, target in ipairs(ctx.targets) do
+    if target.window and target.window.active then return target end
+  end
+  return nil
+end
+
+local function adjacent_vacancy(box, vacancy, direction, tolerance_x, tolerance_y)
+  if direction == "d" then
+    return math.abs(box.y + box.h - vacancy.y) <= tolerance_y and
+      math.abs(box.x - vacancy.x) <= tolerance_x and
+      math.abs(box.w - vacancy.w) <= tolerance_x
+  elseif direction == "u" then
+    return math.abs(vacancy.y + vacancy.h - box.y) <= tolerance_y and
+      math.abs(box.x - vacancy.x) <= tolerance_x and
+      math.abs(box.w - vacancy.w) <= tolerance_x
+  elseif direction == "r" then
+    return math.abs(box.x + box.w - vacancy.x) <= tolerance_x and
+      math.abs(box.y - vacancy.y) <= tolerance_y and
+      math.abs(box.h - vacancy.h) <= tolerance_y
+  elseif direction == "l" then
+    return math.abs(vacancy.x + vacancy.w - box.x) <= tolerance_x and
+      math.abs(box.y - vacancy.y) <= tolerance_y and
+      math.abs(box.h - vacancy.h) <= tolerance_y
+  end
+  return false
+end
+
+local function fill_adjacent_vacancy(ctx, direction)
+  local ws = workspace_id(ctx)
+  local state = ws and load_state(ws)
+  if not state then return nil end
+
+  local focused = focused_target(ctx)
+  if not focused then return nil end
+  local assignment = state.assignments[target_id(focused)]
+  -- Dynamic members share and compact within their zone. Only a fixed slot can
+  -- safely consume a rectangular fixed vacancy without changing other windows.
+  if not assignment or assignment.kind ~= "fixed" or not assignment.box then return nil end
+
+  local tolerance_x = COLUMN_TOLERANCE / math.max(ctx.area.w, 1)
+  local tolerance_y = COLUMN_TOLERANCE / math.max(ctx.area.h, 1)
+  for index, vacancy in ipairs(state.vacancies or {}) do
+    if vacancy.box and adjacent_vacancy(
+        assignment.box, vacancy.box, direction, tolerance_x, tolerance_y) then
+      assignment.box = merged_box(assignment.box, vacancy.box)
+      table.remove(state.vacancies, index)
+      M._fill_consumed = true
+      persist_or_error(state)
+      place_state(ctx, state)
+      return true
+    end
+  end
+  return nil
+end
+
 local function make_focused_dynamic(ctx)
   local ws = workspace_id(ctx)
   local state = ws and load_state(ws)
   if not state then return "workspace is not locked" end
 
-  local focused
-  for _, target in ipairs(ctx.targets) do
-    if target.window and target.window.active then focused = target break end
-  end
+  local focused = focused_target(ctx)
   if not focused then return "no focused tiled window" end
 
   local focus_box = normalized(focused.box, ctx.area)
@@ -694,7 +758,24 @@ end
 function M.layout_msg(ctx, message)
   if message == "recapture" then return recapture(ctx) end
   if message == "dynamic-focused" then return make_focused_dynamic(ctx) end
+  local direction = message:match("^fill%-vacancy ([lrud])$")
+  if direction then return fill_adjacent_vacancy(ctx, direction) end
   return "unknown layout lock command: " .. tostring(message)
+end
+
+function M.directional_action(direction)
+  if not ({ l = true, r = true, u = true, d = true })[direction] then return false end
+  if not hl or not hl.dispatch or not hl.dsp or not hl.dsp.layout or
+      not hl.dsp.window or not hl.dsp.window.swap then
+    return false
+  end
+
+  M._fill_consumed = false
+  hl.dispatch(hl.dsp.layout("fill-vacancy " .. direction))
+  if not M._fill_consumed then
+    hl.dispatch(hl.dsp.window.swap({ direction = direction }))
+  end
+  return true
 end
 
 function M.begin_capture(ws, expected, session, snapshot)
