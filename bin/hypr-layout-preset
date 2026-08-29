@@ -411,18 +411,27 @@ provider_installed() {
 # every config reload, and a half-written file is a syntax error that takes the
 # whole reload down with it. The temp name deliberately does not end in .lua, so
 # require_all's `find -name '*.lua'` cannot pick it up mid-write.
-write_rule_file() {
+stage_rule_file() {
   local ws="$1" content="$2" tmp
-  valid_ws "$ws" || die "refusing to write a workspace rule for '$ws'"
-  mkdir -p "$RULE_DIR" || die "cannot create $RULE_DIR"
-  tmp=$(mktemp "$RULE_DIR/.$ws.rule.XXXXXX") || die "mktemp failed in $RULE_DIR"
+  valid_ws "$ws" || return 1
+  mkdir -p "$RULE_DIR" || return 1
+  tmp=$(mktemp "$RULE_DIR/.$ws.rule.XXXXXX") || return 1
   # mktemp gives 0600; these files sit alongside Omarchy's own, which are
   # written through a plain redirect, so match the umask rather than tightening
   # only the ones this script happens to have touched.
   chmod "$(printf '%o' $((0666 & ~$(umask))))" "$tmp" 2>/dev/null
-  if printf '%s\n' "$content" >"$tmp" && mv -f "$tmp" "$RULE_DIR/$ws.lua"; then
-    return 0
+  if printf '%s\n' "$content" >"$tmp"; then
+    printf '%s\n' "$tmp"
+    return
   fi
+  rm -f "$tmp"
+  return 1
+}
+
+write_rule_file() {
+  local ws="$1" content="$2" tmp
+  tmp=$(stage_rule_file "$ws" "$content") || die "failed to stage $RULE_DIR/$ws.lua"
+  if mv -f "$tmp" "$RULE_DIR/$ws.lua"; then return; fi
   rm -f "$tmp"
   die "failed to write $RULE_DIR/$ws.lua"
 }
@@ -619,7 +628,7 @@ lock_support_reason() {
 
 lock_workspace() {
   local probe="${1:-}" ws key reason layout orientation threshold mfact session tiled
-  local locked_rule begin_lua previous lock_file attempt capture_ok=0 had_previous=0
+  local locked_rule locked_stage begin_lua previous lock_file attempt capture_ok=0 had_previous=0
   [[ -n "$probe" ]] || probe=$(probe)
   ws=$(jq -r '.workspace // 0' <<<"$probe")
   valid_ws "$ws" || die "no ordinary focused workspace (got '$ws')"
@@ -643,9 +652,12 @@ lock_workspace() {
     had_previous=1
   fi
 
-  write_lock_meta "$ws" "$key" "$layout" "$orientation" "$mfact" "$session"
   locked_rule=$(build_locked_rule_lua "$ws" "$session" "$layout" "$orientation")
-  write_rule_file "$ws" "$locked_rule"
+  locked_stage=$(stage_rule_file "$ws" "$locked_rule") || {
+    rm -f "$previous"
+    die "cannot stage the locked workspace rule"
+  }
+  write_lock_meta "$ws" "$key" "$layout" "$orientation" "$mfact" "$session"
   begin_lua=$(build_begin_lock_lua "$ws" "$tiled" "$session")
 
   lock_file=$(lock_layout_path "$ws")
@@ -661,8 +673,15 @@ lock_workspace() {
     if ((had_previous)); then cp "$previous" "$RULE_DIR/$ws.lua"; else rm -f "$RULE_DIR/$ws.lua"; fi
     clear_lock_state "$ws"
     hyprctl eval "$(build_cancel_lock_lua "$ws" "$layout" "$orientation" "$mfact" "$tiled")" >/dev/null 2>&1 || true
-    rm -f "$previous"
+    rm -f "$previous" "$locked_stage"
     die "Hyprland could not capture the layout lock; the previous $key layout was restored"
+  fi
+  if ! mv -f "$locked_stage" "$RULE_DIR/$ws.lua"; then
+    if ((had_previous)); then cp "$previous" "$RULE_DIR/$ws.lua"; else rm -f "$RULE_DIR/$ws.lua"; fi
+    clear_lock_state "$ws"
+    hyprctl eval "$(build_cancel_lock_lua "$ws" "$layout" "$orientation" "$mfact" "$tiled")" >/dev/null 2>&1 || true
+    rm -f "$previous" "$locked_stage"
+    die "could not publish the layout lock; the previous $key layout was restored"
   fi
   rm -f "$previous"
   write_state "$ws" "$key" "$mfact"

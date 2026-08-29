@@ -27,6 +27,11 @@ case "${1:-}" in
     printf '{"id":1}\n'
     ;;
   eval)
+    if [[ "$*" == *begin_capture* ]] &&
+        grep -Fq 'lua:cromewar-ultrawide-lock' "$XDG_STATE_HOME/omarchy/workspace-layouts/1.lua" 2>/dev/null; then
+      printf 'custom rule was published before capture\n' >&2
+      exit 42
+    fi
     if [[ "$*" == *begin_capture* && "${MOCK_LOCK_PERSIST:-1}" == "1" ]]; then
       mkdir -p "$XDG_STATE_HOME/omarchy/layout-locks"
       printf '%s\n' 'return { version = 1, workspace = 1, dynamic_zone = 3, column_count = 3 }' \
