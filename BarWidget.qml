@@ -29,6 +29,11 @@ BarWidget {
   readonly property int workspaceId: state.workspace || 0
   readonly property int monitorWidth: state.width || 0
   readonly property bool isMaster: state.layout === "master"
+  readonly property bool locked: state.locked === true
+  readonly property bool lockSupported: state.lockSupported === true
+  readonly property bool setupPresent: state.setupPresent === true
+  readonly property string lockReason: state.lockReason || ""
+  readonly property int dynamicZone: state.dynamicZone || 0
   // False once a manual resize has pulled the master off the preset's own
   // ratio. Worth showing, because that is the state the snap action undoes.
   readonly property bool snapped: state.snapped === true
@@ -223,34 +228,60 @@ BarWidget {
     onTriggered: root.refresh()
   }
 
-  implicitWidth: face.implicitWidth
-  implicitHeight: face.implicitHeight
+  implicitWidth: barControls.implicitWidth
+  implicitHeight: barControls.implicitHeight
 
-  WidgetButton {
-    id: face
-    anchors.fill: parent
-    bar: root.bar
-    text: root.showLabel && !root.vertical && root.presetLabel !== ""
-      ? root.presetIcon + "  " + root.presetLabel
-      : root.presetIcon
-    fontSize: root.showLabel && !root.vertical ? Style.font.body : Style.font.icon
-    horizontalMargin: 7
-    active: root.popupOpen
-    // The popup is the detail view; a tooltip on top of it would fight it.
-    tooltipText: root.popupOpen ? "" : (
-      root.presetLabel
-        + (root.geometry !== "" ? "   " + root.geometry : "")
-        + (root.snapped ? "" : "   (resized)"))
+  Grid {
+    id: barControls
+    columns: root.vertical ? 1 : 2
+    spacing: 0
 
-    onPressed: function(button) {
-      if (button === Qt.RightButton) root.act(["next"])
-      else if (button === Qt.MiddleButton) root.act(["snap"])
-      else root.popupOpen = !root.popupOpen
+    WidgetButton {
+      id: face
+      bar: root.bar
+      text: root.showLabel && !root.vertical && root.presetLabel !== ""
+        ? root.presetIcon + "  " + root.presetLabel
+        : root.presetIcon
+      fontSize: root.showLabel && !root.vertical ? Style.font.body : Style.font.icon
+      horizontalMargin: 7
+      active: root.popupOpen
+      // The popup is the detail view; a tooltip on top of it would fight it.
+      tooltipText: root.popupOpen ? "" : (
+        root.presetLabel
+          + (root.geometry !== "" ? "   " + root.geometry : "")
+          + (root.locked ? "   Locked" : (root.snapped ? "" : "   (resized)")))
+
+      onPressed: function(button) {
+        if (button === Qt.RightButton) root.act(["next"])
+        else if (button === Qt.MiddleButton) {
+          if (!root.locked) root.act(["snap"])
+        }
+        else root.popupOpen = !root.popupOpen
+      }
+
+      onWheelMoved: function(delta) {
+        if (!root.isMaster || root.locked) return
+        root.scrollBy(delta > 0 ? 1 : -1)
+      }
     }
 
-    onWheelMoved: function(delta) {
-      if (!root.isMaster) return
-      root.scrollBy(delta > 0 ? 1 : -1)
+    // Always visible, so both the current state and the toggle affordance are
+    // obvious without opening the preset picker.
+    WidgetButton {
+      id: lockFace
+      bar: root.bar
+      text: root.locked ? "󰌾" : "󰌿"
+      fontSize: Style.font.icon
+      horizontalMargin: 5
+      active: root.locked
+      dimmed: !root.locked
+      interactive: root.locked || root.lockSupported
+      tooltipText: root.locked
+        ? "Window positions locked · click to unlock"
+        : (root.lockSupported ? "Lock window positions" : root.lockReason)
+      onPressed: function(button) {
+        if (button === Qt.LeftButton) root.act(["toggle-lock"])
+      }
     }
   }
 
@@ -278,6 +309,50 @@ BarWidget {
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.caption
         elide: Text.ElideRight
+      }
+
+      Toggle {
+        id: lockToggle
+        width: parent.width
+        label: "Lock window positions"
+        description: root.locked
+          ? "On · column " + (root.dynamicZone > 0 ? root.dynamicZone : "?") + " accepts new windows"
+          : (root.lockSupported ? "Off · keep empty slots when windows close" : root.lockReason)
+        checked: root.locked
+        enabled: root.locked || root.lockSupported
+        opacity: enabled ? 1 : 0.5
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        accent: root.bar ? root.bar.urgent : Color.urgent
+        onClicked: root.act(["toggle-lock"])
+      }
+
+      Item {
+        width: parent.width
+        height: root.locked ? lockActions.implicitHeight : 0
+        visible: root.locked
+        clip: true
+
+        Row {
+          id: lockActions
+          anchors.horizontalCenter: parent.horizontalCenter
+          spacing: Style.spacing.controlGap
+
+          Button {
+            text: "Recapture"
+            iconText: "󰑓"
+            bordered: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            onClicked: root.act(["recapture-lock"])
+          }
+
+          Button {
+            text: "Focused column is dynamic"
+            iconText: "󰓫"
+            bordered: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            onClicked: root.act(["dynamic-focused"])
+          }
+        }
       }
 
       Repeater {
@@ -380,8 +455,8 @@ BarWidget {
       // stays out of the way under dwindle and scrolling.
       Item {
         width: parent.width
-        height: root.isMaster ? stepper.implicitHeight + Style.spacing.sm : 0
-        visible: root.isMaster
+        height: root.isMaster && !root.locked ? stepper.implicitHeight + Style.spacing.sm : 0
+        visible: root.isMaster && !root.locked
         clip: true
 
         Row {
