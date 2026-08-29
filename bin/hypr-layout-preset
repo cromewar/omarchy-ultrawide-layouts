@@ -534,6 +534,13 @@ build_begin_lock_lua() {
     "$ws" "$expected" "$(lua_escape "$session")" "$rule"
 }
 
+build_cancel_lock_lua() {
+  local ws="$1" layout="$2" orientation="$3" mfact="$4" tiled="${5:-0}" apply
+  apply=$(build_apply_lua "$ws" "$layout" "$orientation" "$mfact" "$tiled")
+  printf 'if _G.cromewar_ultrawide_lock then _G.cromewar_ultrawide_lock.cancel_capture(%s) end; %s\n' \
+    "$ws" "$apply"
+}
+
 # The full chunk `set` executes: the rule, plus the ratio when there is
 # something to apply it to.
 #
@@ -612,7 +619,7 @@ lock_support_reason() {
 
 lock_workspace() {
   local probe="${1:-}" ws key reason layout orientation threshold mfact session tiled
-  local locked_rule begin_lua previous had_previous=0
+  local locked_rule begin_lua previous lock_file attempt capture_ok=0 had_previous=0
   [[ -n "$probe" ]] || probe=$(probe)
   ws=$(jq -r '.workspace // 0' <<<"$probe")
   valid_ws "$ws" || die "no ordinary focused workspace (got '$ws')"
@@ -641,12 +648,21 @@ lock_workspace() {
   write_rule_file "$ws" "$locked_rule"
   begin_lua=$(build_begin_lock_lua "$ws" "$tiled" "$session")
 
-  if ! hyprctl eval "$begin_lua" >/dev/null 2>&1; then
+  lock_file=$(lock_layout_path "$ws")
+  if hyprctl eval "$begin_lua" >/dev/null 2>&1; then
+    # Layout handoff is normally synchronous, but give the compositor a brief
+    # chance to finish transferring targets before declaring capture failed.
+    for attempt in {1..10}; do
+      [[ -s "$lock_file" ]] && { capture_ok=1; break; }
+      sleep 0.02
+    done
+  fi
+  if ((capture_ok == 0)); then
     if ((had_previous)); then cp "$previous" "$RULE_DIR/$ws.lua"; else rm -f "$RULE_DIR/$ws.lua"; fi
     clear_lock_state "$ws"
-    hyprctl eval "$(build_rule_lua "$ws" "$layout" "$orientation")" >/dev/null 2>&1 || true
+    hyprctl eval "$(build_cancel_lock_lua "$ws" "$layout" "$orientation" "$mfact" "$tiled")" >/dev/null 2>&1 || true
     rm -f "$previous"
-    die "Hyprland rejected the layout lock; confirm setup completed without config errors"
+    die "Hyprland could not capture the layout lock; the previous $key layout was restored"
   fi
   rm -f "$previous"
   write_state "$ws" "$key" "$mfact"

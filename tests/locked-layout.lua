@@ -169,9 +169,15 @@ local temp = os.tmpname()
 os.remove(temp)
 os.execute("mkdir -p " .. string.format("%q", temp))
 layout._set_state_dir(temp)
+local real_execute = os.execute
+os.execute = function() return nil, "No child processes", 10 end
 local persisted_left = target("0x30", 8, box(0, 0, 600, 800))
 local persisted_right = target("0x31", 8, box(600, 0, 600, 800))
 capture(8, { persisted_left, persisted_right }, area)
+os.execute = real_execute
+local persisted_file = io.open(temp .. "/8.lua", "r")
+equal("embedded-Lua child status does not block persistence", true, persisted_file ~= nil)
+if persisted_file then persisted_file:close() end
 layout._reset()
 persisted_left.box = box(0, 0, 1200, 800)
 persisted_right.box = box(0, 0, 1, 1)

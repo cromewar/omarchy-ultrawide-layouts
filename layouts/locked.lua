@@ -111,28 +111,35 @@ local function state_path(ws)
   return state_dir .. "/" .. tostring(ws) .. ".lua"
 end
 
-local function ensure_state_dir()
-  -- The path comes only from HOME/XDG_STATE_HOME. %q prevents whitespace or
-  -- shell metacharacters in it from changing the command.
-  local ok = os.execute("mkdir -p " .. string.format("%q", state_dir))
-  return ok == true or ok == 0
-end
-
 local function persist(state)
   if M._persistence_disabled then return true end
-  if not ensure_state_dir() then return false end
+  -- The command that begins a capture creates this directory before asking
+  -- Hyprland to switch algorithms. Do not use os.execute("mkdir -p") here:
+  -- Hyprland reaps the child process itself, so embedded Lua can receive
+  -- `nil, "No child processes", 10` even though mkdir succeeded.
   local path = state_path(state.workspace)
   local temporary = path .. ".tmp"
-  local file = io.open(temporary, "w")
-  if not file then return false end
-  file:write("return ", serialize(state), "\n")
-  file:close()
-  return os.rename(temporary, path) ~= nil
+  local file, open_error = io.open(temporary, "w")
+  if not file then return false, "open " .. temporary .. ": " .. tostring(open_error) end
+  local written, write_error = file:write("return ", serialize(state), "\n")
+  local closed, close_error = file:close()
+  if not written or not closed then
+    os.remove(temporary)
+    return false, "write " .. temporary .. ": " .. tostring(write_error or close_error)
+  end
+  local renamed, rename_error = os.rename(temporary, path)
+  if not renamed then
+    os.remove(temporary)
+    return false, "rename " .. temporary .. ": " .. tostring(rename_error)
+  end
+  return true
 end
 
 local function persist_or_error(state)
-  if not persist(state) then
-    error("could not persist layout lock state for workspace " .. tostring(state.workspace))
+  local ok, detail = persist(state)
+  if not ok then
+    error("could not persist layout lock state for workspace " .. tostring(state.workspace) ..
+      ": " .. tostring(detail))
   end
 end
 

@@ -41,6 +41,8 @@ run_helper() {
   MOCK_KEYBINDINGS="${MOCK_KEYBINDINGS:-SUPER + SPACE → Omarchy menu\\n}" \
   MOCK_RELOAD_MARKER="${MOCK_RELOAD_MARKER:-}" \
   MOCK_CONFIG_ERROR_FILE="${MOCK_CONFIG_ERROR_FILE:-}" \
+  MOCK_LOCK_PERSIST="${MOCK_LOCK_PERSIST:-1}" \
+  MOCK_EVAL_LOG="${MOCK_EVAL_LOG:-}" \
   MOCK_LAYOUT="${MOCK_LAYOUT:-master}" \
   HYPRLAND_INSTANCE_SIGNATURE="mock-session" \
     "$helper" "$@"
@@ -84,6 +86,18 @@ check "status reports installed provider" true "$(jq -r '.setupPresent' <<<"$sta
 run_helper set thirds >/dev/null
 check "preset selection unlocks workspace" no "$([[ -e "$meta" ]] && echo yes || echo no)"
 check "preset replaces lock rule" yes "$(grep -Fq 'layout = "master"' "$rule" && ! grep -Fq 'lua:cromewar' "$rule" && echo yes || echo no)"
+
+printf '%s\n' 'hl.workspace_rule({ workspace = "1", layout = "master", layout_opts = { orientation = "center" } })' >"$rule"
+before=$(sha256sum "$rule")
+eval_log="$test_root/lock-failure-eval.log"
+MOCK_LOCK_PERSIST=0 MOCK_EVAL_LOG="$eval_log"
+if run_helper lock >/dev/null 2>&1; then capture_result=accepted; else capture_result=rolled-back; fi
+unset MOCK_LOCK_PERSIST MOCK_EVAL_LOG
+check "missing capture state rejects lock" rolled-back "$capture_result"
+check "failed lock restores prior rule" "$before" "$(sha256sum "$rule")"
+check "failed lock clears metadata" no "$([[ -e "$meta" ]] && echo yes || echo no)"
+check "rollback restores center orientation" yes "$(grep -Fq 'orientation = "center"' "$eval_log" && echo yes || echo no)"
+check "rollback restores exact ratio" yes "$(grep -Fq 'mfact exact 0.5' "$eval_log" && echo yes || echo no)"
 
 MOCK_LAYOUT=scrolling
 status=$(run_helper status)

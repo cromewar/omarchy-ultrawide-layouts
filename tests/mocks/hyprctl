@@ -27,6 +27,14 @@ case "${1:-}" in
     printf '{"id":1}\n'
     ;;
   eval)
+    if [[ "$*" == *begin_capture* && "${MOCK_LOCK_PERSIST:-1}" == "1" ]]; then
+      mkdir -p "$XDG_STATE_HOME/omarchy/layout-locks"
+      printf '%s\n' 'return { version = 1, workspace = 1, dynamic_zone = 3, column_count = 3 }' \
+        >"$XDG_STATE_HOME/omarchy/layout-locks/1.lua"
+    fi
+    if [[ -n "${MOCK_EVAL_LOG:-}" ]]; then
+      printf '%s\n' "${2:-}" >>"$MOCK_EVAL_LOG"
+    fi
     exit 0
     ;;
   *)
