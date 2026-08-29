@@ -119,8 +119,11 @@ screen slots. Floating windows are ignored, and a Hyprland window group occupies
 one tiled target.
 
 Changing a preset while locked unlocks the workspace and applies the selected
-preset. Resizing and snap controls are disabled until you unlock. To rearrange
-the fixed anchors, unlock, arrange them, and lock again.
+preset. Resizing and snap controls are disabled until you unlock. Hyprland's
+normal `SUPER + SHIFT + Arrow` bindings remain active while locked: explicitly
+swapping two windows also swaps their saved slots, including positions within
+the dynamic stack. Automatic close/open events still preserve every other
+window's slot.
 
 A regular `hyprctl reload` keeps the lock. A full Hyprland restart deliberately
 restores the underlying preset: window identities do not survive a compositor
@@ -265,9 +268,10 @@ result.
 
 The measurement suite uses captured compositor fixtures. The Lua provider has a
 mocked layout context covering capture, vacancies, compaction, dynamic-column
-reassignment, scaling, workspace isolation, and stale sessions. Setup and lock
-lifecycle tests run with a temporary home and mocked Hyprland, so they never
-touch the live desktop config.
+reassignment, intentional directional swaps, reload handoffs, scaling,
+workspace isolation, and stale sessions. Setup and lock lifecycle tests run
+with a temporary home and mocked Hyprland, so they never touch the live desktop
+config.
 
 ```bash
 ./tests/run     # needs bash, jq, and lua

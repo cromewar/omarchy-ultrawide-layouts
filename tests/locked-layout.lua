@@ -99,6 +99,45 @@ equal("closed dynamic leaves right vacant", 900, center.box.x + center.box.w)
 equal("fixed center keeps x", 300, center.box.x)
 equal("fixed center keeps width", 600, center.box.w)
 
+io.write("\nLayout lock — explicit directional swaps\n")
+layout._reset()
+local swap_left = target("0x61", 13, box(0, 0, 300, 800))
+local swap_center = target("0x62", 13, box(300, 0, 600, 800))
+local swap_right = target("0x63", 13, box(900, 0, 300, 800))
+local swap_state = capture(13, { swap_left, swap_center, swap_right }, area)
+
+-- Hyprland implements SUPER + SHIFT + Arrow by swapping these two entries in
+-- the custom layout's target vector, then asking the layout to recalculate.
+layout.recalculate(context(area, { swap_left, swap_right, swap_center }))
+equal("center swaps into right slot", 900, swap_center.box.x)
+equal("right swaps into center slot", 300, swap_right.box.x)
+equal("cross-zone swap transfers fixed role", "fixed", swap_state.assignments["0x63"].kind)
+equal("cross-zone swap transfers dynamic role", "dynamic", swap_state.assignments["0x62"].kind)
+
+layout.recalculate(context(area, { swap_right, swap_left, swap_center }))
+equal("second swap moves right window left", 0, swap_right.box.x)
+equal("second swap moves left window center", 300, swap_left.box.x)
+
+-- Automatic removal after a manual swap still creates a vacancy instead of
+-- moving either remaining window.
+layout.recalculate(context(area, { swap_left, swap_center }))
+equal("close after swap keeps center window", 300, swap_left.box.x)
+equal("close after swap keeps right window", 900, swap_center.box.x)
+local swap_replacement = target("0x64", 13, box(0, 0, 1, 1))
+layout.recalculate(context(area, { swap_left, swap_center, swap_replacement }))
+equal("new window fills manually vacated left slot", 0, swap_replacement.box.x)
+
+io.write("\nLayout lock — explicit dynamic-stack swaps\n")
+layout._reset()
+local stack_left = target("0x71", 14, box(0, 0, 300, 800))
+local stack_center = target("0x72", 14, box(300, 0, 600, 800))
+local stack_top = target("0x73", 14, box(900, 0, 300, 400))
+local stack_bottom = target("0x74", 14, box(900, 400, 300, 400))
+capture(14, { stack_left, stack_center, stack_top, stack_bottom }, area)
+layout.recalculate(context(area, { stack_left, stack_center, stack_bottom, stack_top }))
+equal("bottom swaps into top stack position", 0, stack_bottom.box.y)
+equal("top swaps into bottom stack position", 400, stack_top.box.y)
+
 io.write("\nLayout lock — fixed vacancies are reusable\n")
 layout._reset()
 local vacancy_left = target("0x41", 11, box(0, 0, 300, 800))
@@ -140,6 +179,10 @@ layout.recalculate(context(area, { reload_left }))
 equal("partial reload keeps unseen center assignment", "fixed", reload_state.assignments["0x52"].kind)
 equal("partial reload keeps unseen dynamic assignment", "dynamic", reload_state.assignments["0x53"].kind)
 equal("partial reload creates no false vacancy", 0, #reload_state.vacancies)
+layout.recalculate(context(area, { reload_right, reload_left, reload_center }))
+equal("reload order change keeps left assignment", 0, reload_left.box.x)
+equal("reload order change keeps center assignment", 300, reload_center.box.x)
+equal("reload order change keeps right assignment", 900, reload_right.box.x)
 hl = real_hl
 
 io.write("\nLayout lock — groups are one stable target\n")

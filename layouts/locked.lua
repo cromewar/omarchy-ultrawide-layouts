@@ -64,6 +64,14 @@ local function target_id(target)
   return window_id(target.window, target.index)
 end
 
+local function target_order(targets)
+  local order = {}
+  for _, target in ipairs(targets) do
+    order[#order + 1] = target_id(target)
+  end
+  return order
+end
+
 local function workspace_id(ctx)
   for _, target in ipairs(ctx.targets) do
     local window = target.window
@@ -316,7 +324,7 @@ local function union_boxes(ids, boxes)
   return { x = x1, y = y1, w = x2 - x1, h = y2 - y1 }
 end
 
-local function finalize_capture(state, area)
+local function finalize_capture(state, area, targets)
   local tolerance = COLUMN_TOLERANCE / math.max(area.w, 1)
   local columns = {}
 
@@ -362,6 +370,11 @@ local function finalize_capture(state, area)
 
   state.capture = nil
   state.capture_order = nil
+  -- Hyprland's directional swap action exchanges entries in the custom
+  -- layout's target vector. Keep that order independently from the visual
+  -- capture order so a later explicit swap can be distinguished from an
+  -- automatic close/open event.
+  state.target_order = target_order(targets)
   state.expected = nil
   state.seen = nil
   state.snapshot = nil
@@ -402,6 +415,67 @@ local function live_target_map(ctx)
   return live, by_id
 end
 
+local function table_size(value)
+  local count = 0
+  for _ in pairs(value) do count = count + 1 end
+  return count
+end
+
+local function orders_equal(a, b)
+  if not a or not b or #a ~= #b then return false end
+  for index, id in ipairs(a) do
+    if b[index] ~= id then return false end
+  end
+  return true
+end
+
+local function same_order_members(a, b)
+  if not a or not b or #a ~= #b then return false end
+  local members = {}
+  for _, id in ipairs(a) do members[id] = (members[id] or 0) + 1 end
+  for _, id in ipairs(b) do
+    if not members[id] then return false end
+    members[id] = members[id] - 1
+    if members[id] == 0 then members[id] = nil end
+  end
+  return next(members) == nil
+end
+
+local function apply_explicit_swap(state, current_order)
+  local previous_order = state.target_order
+  if not same_order_members(previous_order, current_order) or
+      orders_equal(previous_order, current_order) then
+    return false
+  end
+
+  -- swapTargets changes vector positions, not window identities. Transfer the
+  -- assignment formerly held at each position to the identity now occupying
+  -- that position. This covers fixed/fixed, fixed/dynamic, and dynamic stack
+  -- swaps without allowing closes or new windows to reflow other slots.
+  local old_assignments = state.assignments
+  local remapped, replacement, previous_members = {}, {}, {}
+  for index, old_id in ipairs(previous_order) do
+    local new_id = current_order[index]
+    replacement[old_id] = new_id
+    previous_members[old_id] = true
+    if old_assignments[old_id] then
+      remapped[new_id] = old_assignments[old_id]
+    end
+  end
+  for id, assignment in pairs(old_assignments) do
+    if not previous_members[id] then remapped[id] = assignment end
+  end
+  state.assignments = remapped
+
+  local dynamic_order = {}
+  for _, id in ipairs(state.dynamic_order or {}) do
+    dynamic_order[#dynamic_order + 1] = replacement[id] or id
+  end
+  state.dynamic_order = dynamic_order
+  state.target_order = current_order
+  return true
+end
+
 local function place_state(ctx, state)
   local live, by_id = live_target_map(ctx)
   -- During a config reload Hyprland transfers targets into the newly created
@@ -410,6 +484,30 @@ local function place_state(ctx, state)
   local present = workspace_target_ids(state.workspace) or live
   local changed = false
   state.vacancies = state.vacancies or {}
+
+  local current_order = target_order(ctx.targets)
+  local present_count = table_size(present)
+  if #current_order < present_count then
+    -- A config reload rebuilds the Lua algorithm one target at a time. Do not
+    -- interpret its temporary partial order as a user-requested swap.
+    state.handoff_in_progress = true
+  elseif state.handoff_in_progress then
+    state.handoff_in_progress = nil
+    if not orders_equal(state.target_order, current_order) then
+      state.target_order = current_order
+      changed = true
+    end
+  elseif not state.target_order then
+    -- Backward compatibility for states captured before target-order tracking.
+    state.target_order = current_order
+    changed = true
+  elseif apply_explicit_swap(state, current_order) then
+    changed = true
+  elseif not orders_equal(state.target_order, current_order) then
+    -- A different set of IDs is a close/open/group event, not a swap.
+    state.target_order = current_order
+    changed = true
+  end
 
   -- Keep the geometry of a closed fixed target as a reusable vacancy. This
   -- preserves the empty slot now and lets the next new window fill that same
@@ -516,7 +614,7 @@ function M.recalculate(ctx)
     if seen >= request.expected then
       requests[ws] = nil
       states[ws] = request
-      finalize_capture(request, ctx.area)
+      finalize_capture(request, ctx.area, ctx.targets)
       place_state(ctx, request)
     else
       -- Until Hyprland has transferred the final target, leave each target in
