@@ -220,11 +220,18 @@ equal("second down press fills column", 800, repeat_top.box.h)
 equal("both stacked vacancies are consumed", 0, #repeat_state.vacancies)
 
 io.write("\nLayout lock — config reload handoff is not a close\n")
+-- A reload re-runs the provider chunk, so its in-memory state is gone and the
+-- saved file is read back while Hyprland transfers the targets one at a time.
 layout._reset()
+layout._persistence_disabled = false
+local reload_dir = os.tmpname()
+os.remove(reload_dir)
+os.execute("mkdir -p " .. string.format("%q", reload_dir))
+layout._set_state_dir(reload_dir)
 local reload_left = target("0x51", 12, box(0, 0, 300, 800))
 local reload_center = target("0x52", 12, box(300, 0, 600, 800))
 local reload_right = target("0x53", 12, box(900, 0, 300, 800))
-local reload_state = capture(12, { reload_left, reload_center, reload_right }, area)
+capture(12, { reload_left, reload_center, reload_right }, area)
 for _, reload_target in ipairs({ reload_left, reload_center, reload_right }) do
   reload_target.window.mapped = true
   reload_target.window.floating = false
@@ -236,15 +243,80 @@ hl = {
     return { reload_left.window, reload_center.window, reload_right.window }
   end,
 }
+layout._reset()
 layout.recalculate(context(area, { reload_left }))
+local reload_state = layout._state(12)
 equal("partial reload keeps unseen center assignment", "fixed", reload_state.assignments["0x52"].kind)
 equal("partial reload keeps unseen dynamic assignment", "dynamic", reload_state.assignments["0x53"].kind)
 equal("partial reload creates no false vacancy", 0, #reload_state.vacancies)
+layout.recalculate(context(area, { reload_left, reload_right }))
+equal("second transfer still keeps center", "fixed", reload_state.assignments["0x52"].kind)
 layout.recalculate(context(area, { reload_right, reload_left, reload_center }))
 equal("reload order change keeps left assignment", 0, reload_left.box.x)
 equal("reload order change keeps center assignment", 300, reload_center.box.x)
 equal("reload order change keeps right assignment", 900, reload_right.box.x)
+equal("reload order change is not a swap", "0x53", reload_state.dynamic_order[1])
+
+-- A window closed between the save and the reload must not hold the handoff
+-- open: Hyprland's window list bounds how many targets can still arrive.
+layout._reset()
+hl = {
+  get_workspace_windows = function()
+    return { reload_left.window, reload_right.window }
+  end,
+}
+layout.recalculate(context(area, { reload_left, reload_right }))
+reload_state = layout._state(12)
+equal("missing window ends the handoff", 1, #reload_state.vacancies)
+equal("missing window's slot is vacated", "0x52", reload_state.vacancies[1].former)
 hl = real_hl
+os.remove(reload_dir .. "/12.lua")
+os.remove(reload_dir)
+layout._persistence_disabled = true
+
+io.write("\nLayout lock — a close is a close, even while Hyprland still lists the window\n")
+-- CWindow::unmapWindow removes the layout target before it clears the mapped
+-- flag, so during the recalculate a close triggers the window is still in the
+-- workspace list. That must not be mistaken for a reload handoff.
+layout._reset()
+local close_left = target("0x101", 17, box(0, 0, 300, 800))
+local close_center = target("0x102", 17, box(300, 0, 600, 800))
+local close_top = target("0x103", 17, box(900, 0, 300, 400))
+local close_bottom = target("0x104", 17, box(900, 400, 300, 400))
+local close_state = capture(17, { close_left, close_center, close_top, close_bottom }, area)
+for _, t in ipairs({ close_left, close_center, close_top, close_bottom }) do
+  t.window.mapped = true
+  t.window.floating = false
+  t.window.fullscreen = 0
+end
+real_hl = hl
+hl = {
+  get_workspace_windows = function()
+    return { close_left.window, close_center.window, close_top.window, close_bottom.window }
+  end,
+}
+layout.recalculate(context(area, { close_left, close_center, close_bottom }))
+equal("closed dynamic member compacts at once", 800, close_bottom.box.h)
+equal("closed dynamic member leaves the order", 1, #close_state.dynamic_order)
+layout.recalculate(context(area, { close_left, close_bottom }))
+equal("closed fixed slot is vacated at once", 1, #close_state.vacancies)
+equal("vacancy remembers who left", "0x102", close_state.vacancies[1].former)
+equal("left window does not move", 0, close_left.box.x)
+hl = real_hl
+
+io.write("\nLayout lock — a remapped window gets its own slot back\n")
+-- GTK clients unmap and remap a toplevel without the process going anywhere;
+-- Hyprland reports that as a close plus a new window with the same identity.
+layout.recalculate(context(area, { close_bottom }))
+equal("two vacancies after a second close", 2, #close_state.vacancies)
+local remapped_center = target("0x102", 17, box(0, 0, 1, 1))
+layout.recalculate(context(area, { close_bottom, remapped_center }))
+equal("remapped window takes its own slot", 300, remapped_center.box.x)
+equal("older vacancy is left for a stranger", 1, #close_state.vacancies)
+local stranger = target("0x105", 17, box(0, 0, 1, 1))
+layout.recalculate(context(area, { close_bottom, remapped_center, stranger }))
+equal("stranger takes the oldest vacancy", 0, stranger.box.x)
+equal("no vacancies remain", 0, #close_state.vacancies)
 
 io.write("\nLayout lock — groups are one stable target\n")
 layout._reset()
@@ -298,6 +370,25 @@ equal("dynamic-focused succeeds", true, result)
 equal("focused left becomes dynamic", "dynamic", state.assignments["0x1"].kind)
 equal("old right member becomes fixed", "fixed", state.assignments["0x4"].kind)
 equal("new dynamic zone has full height", 800, left.box.h)
+
+io.write("\nLayout lock — dynamic-focused folds vacancies in its column\n")
+layout._reset()
+local fold_top = target("0x111", 18, box(0, 0, 300, 400), true)
+local fold_bottom = target("0x112", 18, box(0, 400, 300, 400))
+local fold_center = target("0x113", 18, box(300, 0, 600, 800))
+local fold_right = target("0x114", 18, box(900, 0, 300, 800))
+local fold_state = capture(18, { fold_top, fold_bottom, fold_center, fold_right }, area)
+layout.recalculate(context(area, { fold_top, fold_center, fold_right }))
+equal("closed lower-left leaves a vacancy", 1, #fold_state.vacancies)
+equal("dynamic-focused on the left column succeeds", true,
+  layout.layout_msg(context(area, { fold_top, fold_center, fold_right }), "dynamic-focused"))
+equal("vacancy in the new dynamic column is absorbed", 0, #fold_state.vacancies)
+equal("dynamic zone spans the whole column", 800, fold_top.box.h)
+local fold_new = target("0x115", 18, box(0, 0, 1, 1))
+layout.recalculate(context(area, { fold_top, fold_center, fold_right, fold_new }))
+equal("new window stacks under the focused one", 400, fold_new.box.y)
+equal("stacked windows share the column", 400, fold_top.box.h)
+equal("old dynamic column is now fixed", "fixed", fold_state.assignments["0x114"].kind)
 
 io.write("\nLayout lock — recapture and workspace scaling\n")
 center.window.active = true
