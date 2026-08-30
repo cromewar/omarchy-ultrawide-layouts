@@ -129,10 +129,20 @@ vacancy in that direction, expansion takes priority and the focused window
 consumes it. Additional adjacent vacancies can be consumed one press at a time.
 Automatic close/open events still preserve every other window's slot.
 
+Some GTK apps — Ghostty is one — occasionally unmap and remap a toplevel
+without the process going anywhere. Hyprland reports that as a close followed
+by a new window. Under a native layout the window comes back as a fresh master
+(Omarchy sets `master:new_status = master`) and everything else reflows around
+it; under a lock the window simply gets its own slot back, because a vacancy
+remembers who left it.
+
 A regular `hyprctl reload` keeps the lock. A full Hyprland restart deliberately
 restores the underlying preset: window identities do not survive a compositor
 session, so replaying the old assignments could put unrelated windows in saved
-slots. The saved lock is then treated as stale and can be removed by `prune`.
+slots. The first command that looks at that workspace afterwards — the bar's
+own status read included — notices the stale lock, writes the plain base rule
+back and discards the old geometry. `prune` does the same for workspaces that
+no longer exist.
 
 ## Keybindings
 

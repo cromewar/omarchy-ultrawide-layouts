@@ -45,7 +45,8 @@ run_helper() {
   MOCK_EVAL_LOG="${MOCK_EVAL_LOG:-}" \
   MOCK_LAYOUT="${MOCK_LAYOUT:-master}" \
   MOCK_ACTIVEWINDOW_BEFORE="${MOCK_ACTIVEWINDOW_BEFORE:-}" \
-  HYPRLAND_INSTANCE_SIGNATURE="mock-session" \
+  MOCK_EVAL_FAIL="${MOCK_EVAL_FAIL:-}" \
+  HYPRLAND_INSTANCE_SIGNATURE="${MOCK_SESSION-mock-session}" \
     "$helper" "$@"
 }
 
@@ -91,6 +92,27 @@ check "status reports the underlying preset" center "$(jq -r '.key' <<<"$status"
 check "status reports active lock" true "$(jq -r '.locked' <<<"$status")"
 check "status reports installed provider" true "$(jq -r '.setupPresent' <<<"$status")"
 
+printf '\nLock messages — routed through eval, never the legacy dispatcher\n'
+message_log="$test_root/message-eval.log"
+MOCK_EVAL_LOG="$message_log" run_helper recapture-lock
+check "recapture-lock succeeds" 0 "$?"
+check "recapture goes through hl.dsp.layout" yes \
+  "$(grep -Fq 'hl.dispatch(hl.dsp.layout("recapture"))' "$message_log" && echo yes || echo no)"
+MOCK_EVAL_LOG="$message_log" run_helper dynamic-focused
+check "dynamic-focused succeeds" 0 "$?"
+check "dynamic-focused goes through hl.dsp.layout" yes \
+  "$(grep -Fq 'hl.dsp.layout("dynamic-focused")' "$message_log" && echo yes || echo no)"
+
+printf '\nStale lock — a new compositor session reconciles on first look\n'
+status=$(MOCK_SESSION=another-session run_helper status)
+check "stale lock reads as unlocked" false "$(jq -r '.locked' <<<"$status")"
+check "stale metadata is removed" no "$([[ -e "$meta" ]] && echo yes || echo no)"
+check "stale rule becomes the base rule" yes \
+  "$(grep -Fq 'orientation = "center"' "$rule" && ! grep -Fq 'lua:cromewar' "$rule" && echo yes || echo no)"
+run_helper lock >/dev/null
+MOCK_SESSION= run_helper status >/dev/null
+check "lock without a signature is left alone" yes "$([[ -e "$meta" ]] && echo yes || echo no)"
+
 printf '\nDirectional action — locked provider and native fallback\n'
 active_before='{"address":"0x1","workspace":{"id":1},"at":[0,0],"size":[300,400]}'
 directional_eval_log="$test_root/directional-eval.log"
@@ -98,6 +120,11 @@ MOCK_ACTIVEWINDOW_BEFORE="$active_before" MOCK_EVAL_LOG="$directional_eval_log" 
   run_helper directional down
 check "locked direction delegates synchronously" yes \
   "$(grep -Fq 'directional_action("d")' "$directional_eval_log" && echo yes || echo no)"
+: >"$directional_eval_log"
+MOCK_ACTIVEWINDOW_BEFORE="$active_before" MOCK_EVAL_LOG="$directional_eval_log" \
+  MOCK_EVAL_FAIL="directional_action" run_helper directional up 2>/dev/null
+check "unreachable provider still swaps natively" yes \
+  "$(grep -Fq 'window.swap({ direction = "u" })' "$directional_eval_log" && echo yes || echo no)"
 
 run_helper set thirds >/dev/null
 check "preset selection unlocks workspace" no "$([[ -e "$meta" ]] && echo yes || echo no)"

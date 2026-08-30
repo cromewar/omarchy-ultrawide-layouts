@@ -20,6 +20,12 @@ end
 local state_dir = state_home .. "/omarchy/layout-locks"
 local states = {}
 local requests = {}
+-- Workspaces whose state was just read back from disk. That only happens after
+-- a config reload re-ran this chunk, and Hyprland then rebuilds the workspace's
+-- algorithm by transferring its targets one at a time; until they have all
+-- arrived a short target list is not a close. The value is how many targets
+-- the saved state expects.
+local handoffs = {}
 
 local function copy_box(box)
   return { x = box.x, y = box.y, w = box.w, h = box.h }
@@ -159,7 +165,11 @@ local function load_state(ws)
   local ok, state = pcall(loader)
   if not ok or type(state) ~= "table" or state.version ~= VERSION then return nil end
   if state.session ~= (os.getenv("HYPRLAND_INSTANCE_SIGNATURE") or "") then return nil end
+  -- Written by earlier versions, which inferred handoffs from the workspace's
+  -- window list. Never trust it from disk.
+  state.handoff_in_progress = nil
   states[ws] = state
+  handoffs[ws] = state.target_order and #state.target_order or 0
   return state
 end
 
@@ -390,6 +400,7 @@ local function finalize_capture(state, area, targets)
   state.seen = nil
   state.snapshot = nil
   state.area = normalized(area, area)
+  handoffs[state.workspace] = nil
   persist_or_error(state)
 end
 
@@ -487,23 +498,75 @@ local function apply_explicit_swap(state, current_order)
   return true
 end
 
+-- Every live target gets a box, every time. A target Hyprland hands us that we
+-- leave untouched keeps whatever geometry it had — for a brand-new window that
+-- is nothing useful — so even mid-handoff strays share the dynamic zone.
+local function place_assignments(ctx, state, by_id)
+  local stack = {}
+  for _, id in ipairs(state.dynamic_order or {}) do
+    if by_id[id] then stack[#stack + 1] = by_id[id] end
+  end
+  for _, target in ipairs(ctx.targets) do
+    local id = target_id(target)
+    local assignment = state.assignments[id]
+    if assignment and assignment.kind == "fixed" and assignment.box then
+      target:place(denormalized(assignment.box, ctx.area))
+    elseif not assignment then
+      stack[#stack + 1] = target
+    end
+  end
+
+  local count = #stack
+  if count == 0 then return end
+  local zone = denormalized(state.dynamic_box or { x = 0, y = 0, w = 1, h = 1 }, ctx.area)
+  for index, target in ipairs(stack) do
+    target:place({
+      x = zone.x,
+      y = zone.y + zone.h * (index - 1) / count,
+      w = zone.w,
+      h = zone.h / count,
+    })
+  end
+end
+
+-- A window that vacated a slot and comes straight back gets that slot again.
+-- GTK clients (Ghostty among them) unmap and remap a toplevel without the
+-- process going anywhere, which Hyprland reports as a close followed by a new
+-- window, and a target that is transferred during a reload looks the same.
+-- Otherwise the oldest vacancy wins, so the left/centre slots refill before a
+-- new window is diverted to the dynamic column.
+local function take_vacancy(state, id)
+  for index, vacancy in ipairs(state.vacancies) do
+    if vacancy.former == id then return table.remove(state.vacancies, index) end
+  end
+  if #state.vacancies > 0 then return table.remove(state.vacancies, 1) end
+  return nil
+end
+
 local function place_state(ctx, state)
   local live, by_id = live_target_map(ctx)
-  -- During a config reload Hyprland transfers targets into the newly created
-  -- custom algorithm one at a time. The workspace query distinguishes a real
-  -- close from a target that simply has not reached this callback yet.
-  local present = workspace_target_ids(state.workspace) or live
+  local ws = state.workspace
   local changed = false
   state.vacancies = state.vacancies or {}
+  state.dynamic_order = state.dynamic_order or {}
 
   local current_order = target_order(ctx.targets)
-  local present_count = table_size(present)
-  if #current_order < present_count then
-    -- A config reload rebuilds the Lua algorithm one target at a time. Do not
-    -- interpret its temporary partial order as a user-requested swap.
-    state.handoff_in_progress = true
-  elseif state.handoff_in_progress then
-    state.handoff_in_progress = nil
+  local pending = handoffs[ws]
+  if pending then
+    -- Hyprland's own window list bounds the count, so a window that closed
+    -- between the save and the reload cannot leave the handoff open forever.
+    -- The list is only consulted here: during the recalculate a close
+    -- triggers, the closing window is still mapped (removeTarget runs before
+    -- the mapped flag drops), so it cannot tell a close from a transfer.
+    local present = workspace_target_ids(ws)
+    local expected = present and math.min(pending, table_size(present)) or pending
+    if #current_order < expected then
+      place_assignments(ctx, state, by_id)
+      return
+    end
+    handoffs[ws] = nil
+    -- The rebuilt vector may list the same targets in another order. That is
+    -- not a swap request; adopt it.
     if not orders_equal(state.target_order, current_order) then
       state.target_order = current_order
       changed = true
@@ -523,11 +586,13 @@ local function place_state(ctx, state)
   -- Keep the geometry of a closed fixed target as a reusable vacancy. This
   -- preserves the empty slot now and lets the next new window fill that same
   -- left/center position rather than being diverted to the dynamic column.
-  for id, assignment in pairs(state.assignments) do
-    if assignment.kind == "fixed" and not present[id] then
+  for _, id in ipairs(sorted_keys(state.assignments)) do
+    local assignment = state.assignments[id]
+    if assignment.kind == "fixed" and not live[id] then
       state.vacancies[#state.vacancies + 1] = {
         zone = assignment.zone,
         box = assignment.box,
+        former = id,
       }
       state.assignments[id] = nil
       changed = true
@@ -536,8 +601,8 @@ local function place_state(ctx, state)
 
   -- Dynamic members compact inside their shared zone when one closes.
   local next_order = {}
-  for _, id in ipairs(state.dynamic_order or {}) do
-    if present[id] then
+  for _, id in ipairs(state.dynamic_order) do
+    if live[id] then
       next_order[#next_order + 1] = id
     else
       state.assignments[id] = nil
@@ -551,8 +616,8 @@ local function place_state(ctx, state)
   for _, target in ipairs(ctx.targets) do
     local id = target_id(target)
     if not state.assignments[id] then
-      if #state.vacancies > 0 then
-        local vacancy = table.remove(state.vacancies, 1)
+      local vacancy = take_vacancy(state, id)
+      if vacancy then
         state.assignments[id] = {
           kind = "fixed",
           zone = vacancy.zone,
@@ -566,29 +631,7 @@ local function place_state(ctx, state)
     end
   end
 
-  for id, assignment in pairs(state.assignments) do
-    local target = by_id[id]
-    if target and assignment.kind == "fixed" and assignment.box then
-      target:place(denormalized(assignment.box, ctx.area))
-    end
-  end
-
-  local count = #state.dynamic_order
-  if count > 0 then
-    local zone = denormalized(state.dynamic_box, ctx.area)
-    for index, id in ipairs(state.dynamic_order) do
-      local target = by_id[id]
-      if target then
-        target:place({
-          x = zone.x,
-          y = zone.y + zone.h * (index - 1) / count,
-          w = zone.w,
-          h = zone.h / count,
-        })
-      end
-    end
-  end
-
+  place_assignments(ctx, state, by_id)
   if changed then persist_or_error(state) end
 end
 
@@ -611,7 +654,12 @@ end
 
 function M.recalculate(ctx)
   local ws = workspace_id(ctx)
-  if not ws then return end
+  if not ws then
+    -- No target exposes a workspace; returning without placing anything would
+    -- leave every window wherever Hyprland last put it.
+    fallback_grid(ctx)
+    return
+  end
 
   local request = requests[ws]
   if request then
@@ -740,14 +788,29 @@ local function make_focused_dynamic(ctx)
 
   state.dynamic_order = {}
   state.dynamic_zone = (state.assignments[target_id(focused)] or {}).zone or 0
-  state.dynamic_box = union_boxes(new_dynamic, (function()
-    local boxes = {}
-    for _, target in ipairs(ctx.targets) do boxes[target_id(target)] = normalized(target.box, ctx.area) end
-    return boxes
-  end)())
+  local boxes = {}
+  for _, target in ipairs(ctx.targets) do
+    boxes[target_id(target)] = normalized(target.box, ctx.area)
+  end
+  -- A vacancy inside the new dynamic column would let the next window land on
+  -- top of the stack. Fold those into the zone instead; the stack fills them.
+  local kept = {}
+  for _, vacancy in ipairs(state.vacancies or {}) do
+    if vacancy.box and math.abs(vacancy.box.x - focus_box.x) <= tolerance then
+      local id = "vacancy:" .. #new_dynamic
+      boxes[id] = vacancy.box
+      new_dynamic[#new_dynamic + 1] = id
+    else
+      kept[#kept + 1] = vacancy
+    end
+  end
+  state.vacancies = kept
+  state.dynamic_box = union_boxes(new_dynamic, boxes)
   for _, id in ipairs(new_dynamic) do
-    state.assignments[id] = { kind = "dynamic", zone = state.dynamic_zone }
-    state.dynamic_order[#state.dynamic_order + 1] = id
+    if not id:match("^vacancy:") then
+      state.assignments[id] = { kind = "dynamic", zone = state.dynamic_zone }
+      state.dynamic_order[#state.dynamic_order + 1] = id
+    end
   end
 
   persist_or_error(state)
@@ -786,6 +849,7 @@ function M.cancel_capture(ws)
   ws = tonumber(ws)
   requests[ws] = nil
   states[ws] = nil
+  handoffs[ws] = nil
   return true
 end
 
@@ -794,6 +858,7 @@ function M._set_state_dir(path) state_dir = path end
 function M._reset()
   states = {}
   requests = {}
+  handoffs = {}
 end
 function M._state(ws) return states[tonumber(ws)] end
 

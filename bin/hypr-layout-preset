@@ -299,7 +299,10 @@ resolve_key() {
 # file and writes no orientation, so an absent key legitimately means "whatever
 # the global option says" rather than a missing value.
 rule_orientation() {
-  local ws="$1" global="$2" live_layout="${3:-}" f="$RULE_DIR/$ws.lua" o="" l=""
+  local ws="$1" global="$2" live_layout="${3:-}" f o="" l=""
+  # Assigned separately: bash expands every word of a `local` line before any
+  # of its assignments happen, so "$ws" on the same line would be the caller's.
+  f="$RULE_DIR/$ws.lua"
   if [[ -r "$f" ]]; then
     l=$(sed -n 's/.*layout[[:space:]]*=[[:space:]]*"\([a-z]*\)".*/\1/p' "$f" | head -1)
     # Trust the orientation only while the file still describes the live layout.
@@ -401,10 +404,40 @@ clear_lock_state() {
   rm -f "$(lock_meta_path "$ws")" "$(lock_layout_path "$ws")" "$LOCK_DIR/$ws.lua.tmp"
 }
 
+# Put the saved base rule back and drop the lock files. Used when a lock is
+# stale — its metadata names another compositor session — or the workspace is
+# gone.
+restore_base_rule() {
+  local ws="$1" layout orientation
+  layout=$(lock_base_field "$ws" baseLayout)
+  orientation=$(lock_base_field "$ws" baseOrientation)
+  write_rule_file "$ws" "$(build_rule_lua "$ws" "${layout:-dwindle}" "$orientation")"
+  clear_lock_state "$ws"
+}
+
+# A full Hyprland restart already falls back to the base rule (the rule file's
+# signature test fails), but the metadata and geometry linger and the rule file
+# keeps its conditional. Reconcile on the first command that looks, so nothing
+# depends on someone running `prune`. Returns 0 when something was stale.
+reconcile_stale_lock() {
+  local ws="$1"
+  valid_ws "$ws" || return 1
+  [[ -r "$(lock_meta_path "$ws")" ]] || return 1
+  # Without a signature to compare against nothing can be called stale; a
+  # process that lacks the variable must not dismantle a live lock.
+  [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || return 1
+  lock_meta_current "$ws" && return 1
+  restore_base_rule "$ws"
+}
+
+# Any copy of the provider counts, not only the one next to this script: the
+# plugin is normally run from the omarchy-installed copy, but a checkout
+# elsewhere talks to the same compositor, and it is the loaded provider that
+# answers `hyprctl eval` either way.
 provider_installed() {
-  [[ -r "$LOCK_PROVIDER" && -r "$HYPRLAND_CONFIG" ]] || return 1
+  [[ -r "$HYPRLAND_CONFIG" ]] || return 1
   grep -Fq -- "$LOCK_PROVIDER_BEGIN" "$HYPRLAND_CONFIG" &&
-    grep -Fq -- "dofile(\"$(lua_escape "$LOCK_PROVIDER")\")" "$HYPRLAND_CONFIG"
+    grep -Eq -- '^dofile\(".*/layouts/locked\.lua"\)' "$HYPRLAND_CONFIG"
 }
 
 # Rewritten in place via a temp file: this directory is sourced by Hyprland on
@@ -438,7 +471,7 @@ write_rule_file() {
 
 # Workspaces come and go; their state files should not outlive them.
 prune_state() {
-  local live f base ws meta_session layout orientation
+  local live f base ws meta_session
   live=$(hyprctl workspaces -j 2>/dev/null | jq -r '.[].id' | tr '\n' ' ')
   [[ -n "$live" ]] || return 0
 
@@ -451,10 +484,7 @@ prune_state() {
     valid_ws "$ws" || continue
     meta_session=$(jq -r '.session // ""' "$f")
     if [[ "$meta_session" != "${HYPRLAND_INSTANCE_SIGNATURE:-}" || " $live " != *" $ws "* ]]; then
-      layout=$(jq -r '.baseLayout // "dwindle"' "$f")
-      orientation=$(jq -r '.baseOrientation // ""' "$f")
-      write_rule_file "$ws" "$(build_rule_lua "$ws" "$layout" "$orientation")"
-      clear_lock_state "$ws"
+      restore_base_rule "$ws"
     fi
   done
 
@@ -582,13 +612,14 @@ apply_preset() {
     return 0
   fi
 
-  warn "hyprctl eval rejected the workspace rule; falling back to hyprctl keyword"
-  hyprctl keyword workspace "$ws, layout:$layout" >/dev/null 2>&1 ||
-    warn "fallback 'hyprctl keyword workspace' also failed"
-  if [[ -n "$mfact" ]]; then
-    hyprctl dispatch layoutmsg "mfact exact $mfact" >/dev/null 2>&1 ||
-      warn "could not apply mfact $mfact"
-  fi
+  # When the chunk fails it is almost always the mfact dispatch — nothing
+  # focused to resize, or a layout that rejects it — and the rule went down
+  # with it. The rule is the part that persists, so land it on its own. There
+  # is no other route: Hyprland's Lua config has no legacy `hyprctl keyword`
+  # or `hyprctl dispatch` parser any more.
+  warn "hyprctl eval rejected the preset chunk; applying the workspace rule alone"
+  hyprctl eval "$rule" >/dev/null 2>&1 ||
+    warn "could not apply the workspace rule for workspace $ws"
 }
 
 apply_mfact() {
@@ -633,6 +664,7 @@ lock_workspace() {
   ws=$(jq -r '.workspace // 0' <<<"$probe")
   valid_ws "$ws" || die "no ordinary focused workspace (got '$ws')"
   lock_meta_current "$ws" && return 0
+  reconcile_stale_lock "$ws" || true
 
   key=$(current_key "$probe" "$ws")
   if ! reason=$(lock_support_reason "$probe" "$key"); then die "$reason"; fi
@@ -711,7 +743,11 @@ lock_layout_message() {
   probe=$(probe)
   ws=$(jq -r '.workspace // 0' <<<"$probe")
   lock_meta_current "$ws" || die "the focused workspace is not layout-locked"
-  hyprctl dispatch layoutmsg "$message" >/dev/null 2>&1 || die "Hyprland could not $label"
+  # Hyprland's Lua config retired the legacy dispatcher parser, so
+  # `hyprctl dispatch layoutmsg ...` is a syntax error there. eval is the one
+  # route that works, and it also surfaces the provider's own error text.
+  hyprctl eval "hl.dispatch(hl.dsp.layout(\"$(lua_escape "$message")\"))" >/dev/null 2>&1 ||
+    die "Hyprland could not $label"
 }
 
 directional_action() {
@@ -730,10 +766,13 @@ directional_action() {
   if lock_meta_current "$ws"; then
     # The provider tries an adjacent vacancy and synchronously falls back to
     # Hyprland's native swap when there is nothing rectangular to consume.
+    # This wrapper owns Omarchy's stock SUPER + SHIFT + Arrow chords, so if
+    # the provider is unreachable (config reverted, plugin removed without
+    # teardown) the keys must still swap rather than go dead.
     hyprctl eval \
       "_G.cromewar_ultrawide_lock.directional_action(\"$direction\")" \
-      >/dev/null 2>&1 || die "Hyprland could not move the focused window $label"
-    return 0
+      >/dev/null 2>&1 && return 0
+    warn "layout lock provider did not answer; swapping natively"
   fi
 
   hyprctl eval "hl.dispatch(hl.dsp.window.swap({ direction = \"$direction\" }))" \
@@ -854,6 +893,7 @@ cmd_status() {
   layout=$(jq -r '.layout // ""' <<<"$probe")
   if provider_installed; then setup_present=true; fi
 
+  reconcile_stale_lock "$ws" || true
   if lock_meta_current "$ws"; then
     locked=true
     lock_supported=true

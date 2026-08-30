@@ -12,6 +12,16 @@ if [[ "${1:-}" == "--batch" ]]; then
 fi
 
 case "${1:-}" in
+  # Hyprland's Lua config has no legacy parser: both of these are hard errors
+  # on 0.56, exactly as they are here.
+  dispatch)
+    printf "error: [string \"return hl.dispatch(%s)\"]:1: ')' expected\n" "${2:-}" >&2
+    exit 1
+    ;;
+  keyword)
+    printf "keyword can't work with non-legacy parsers. Use eval.\n" >&2
+    exit 1
+    ;;
   configerrors)
     if [[ -n "${MOCK_CONFIG_ERROR_FILE:-}" && -e "$MOCK_CONFIG_ERROR_FILE" ]]; then
       printf 'mock configuration error\n'
@@ -46,6 +56,10 @@ case "${1:-}" in
     fi
     if [[ -n "${MOCK_EVAL_LOG:-}" ]]; then
       printf '%s\n' "${2:-}" >>"$MOCK_EVAL_LOG"
+    fi
+    if [[ -n "${MOCK_EVAL_FAIL:-}" && "$*" == *"$MOCK_EVAL_FAIL"* ]]; then
+      printf 'error: mock refused this chunk\n' >&2
+      exit 7
     fi
     exit 0
     ;;

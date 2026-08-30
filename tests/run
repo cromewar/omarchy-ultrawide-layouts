@@ -137,6 +137,21 @@ geom right 5120 0.4 2 "3072 · 2048"
 geom dwindle 5120 "" 3 "binary split"
 
 echo
+echo "Orientation — read back from the rule file, locked or not"
+# A locked rule names two layouts on one line: the provider in the `if` branch
+# and the saved base in the `else`. Only the base carries an orientation.
+tmp_rules=$(mktemp -d)
+RULE_DIR="$tmp_rules"
+printf '%s\n' 'hl.workspace_rule({ workspace = "1", layout = "master", layout_opts = { orientation = "center" } })' >"$tmp_rules/1.lua"
+printf '%s\n' 'if os.getenv("HYPRLAND_INSTANCE_SIGNATURE") == "x" then hl.workspace_rule({ workspace = "2", layout = "lua:cromewar-ultrawide-lock" }) else hl.workspace_rule({ workspace = "2", layout = "master", layout_opts = { orientation = "right" } }) end' >"$tmp_rules/2.lua"
+printf '%s\n' 'hl.workspace_rule({ workspace = "3", layout = "dwindle" })' >"$tmp_rules/3.lua"
+check "plain rule" center "$(rule_orientation 1 left master)"
+check "locked rule reads its base branch" right "$(rule_orientation 2 left master)"
+check "other layout's rule is not trusted" left "$(rule_orientation 3 left master)"
+check "missing rule uses the global" left "$(rule_orientation 4 left master)"
+rm -rf "$tmp_rules"
+
+echo
 echo "Apply — the ratio must actually be in the chunk that set runs"
 # This is the one that got shipped broken: apply_preset took the tiled count as
 # its fifth argument and set_preset passed four, so the guard read 0 and every
