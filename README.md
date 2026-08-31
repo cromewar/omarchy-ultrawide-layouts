@@ -84,6 +84,44 @@ every pair.
 The picker header names the workspace, its monitor, and that monitor's width, so
 the numbers next to each preset are the widths you will actually get.
 
+## Locking a layout
+
+Locking freezes the window positions on the focused workspace so that closing
+one window never moves the others. Step by step:
+
+1. **Run `setup` once** (see [Install](#install)). Locking needs the small Lua
+   layout provider it adds to `~/.config/hypr/hyprland.lua`; until then the lock
+   button stays greyed out and its tooltip says so.
+2. **Pick a preset and arrange the workspace.** Open the windows you want, choose
+   Center master / Even thirds / Master left / Master right / Dwindle, and drag or
+   scroll the master column to the ratio you like. At least two tiled windows
+   must be visible and nothing may be fullscreen. Scrolling cannot be locked.
+3. **Lock it** — any of these does the same thing:
+   - click the padlock icon next to the preset icon in the bar (󰌿 → 󰌾);
+   - open the picker (left click) and flip the **Lock window positions** switch;
+   - press `SUPER + ALT + L` (or the chord you gave `setup --key`);
+   - run `hypr-layout-preset lock` from a terminal.
+
+The padlock turns solid and the tooltip reads *Window positions locked*. From
+now on the boxes on screen are **slots**: a closed window leaves its slot empty,
+the next new window takes a vacant slot if there is one, and otherwise joins the
+rightmost column, which stays dynamic so new tools keep stacking there. If the lock is refused, hover the padlock — the
+tooltip names the reason (*Open at least two tiled windows…*, *Exit fullscreen…*,
+*The scrolling layout cannot be locked*).
+
+While locked, the picker gains two buttons:
+
+- **Recapture** — you moved things around and want the *current* arrangement to
+  become the saved slots.
+- **Focused column is dynamic** — make the column holding the focused window the
+  one that new windows join, instead of the rightmost.
+
+To **unlock**, click the padlock again, flip the switch off, press
+`SUPER + ALT + L`, or run `hypr-layout-preset unlock`. Choosing a different
+preset while locked also unlocks and applies that preset. The lock is per
+workspace, survives `hyprctl reload`, and is deliberately dropped by a full
+Hyprland restart (see below).
+
 ## Stable layout slots
 
 While unlocked, presets deliberately use Hyprland's native `master`, `dwindle`,
