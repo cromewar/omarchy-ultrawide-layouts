@@ -6,7 +6,10 @@
   "author": "Vasiliy Kirochka",
   "license": "MIT",
   "homepage": "https://github.com/cromewar/omarchy-ultrawide-layouts",
+  "repository": "https://github.com/cromewar/omarchy-ultrawide-layouts",
   "description": "Switch ultrawide Hyprland presets and optionally lock window slots so closing one window does not move the others.",
+  "minOmarchyVersion": "4.0.0",
+  "preview": "preview.png",
   "kinds": ["bar-widget"],
   "entryPoints": { "barWidget": "BarWidget.qml" },
   "barWidget": {
